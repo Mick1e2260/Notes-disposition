@@ -26,6 +26,7 @@ import pandas as pd
 
 import daily_mask as dm
 import gui
+import headermem as hm
 import mask_columns as mc
 import phi_scrub as ps
 import reidentify
@@ -107,7 +108,8 @@ def col_stats(s):
 def columns_of(path, sheet):
     df = frame(path, sheet)
     cols = [str(c) for c in df.columns]
-    return {"columns": cols, "roles": mc.saved_roles(cols), "profile": dm.detect_profile(cols),
+    roles, src = hm.role_map(cols, mc.guess_role, mc.guess_kind)
+    return {"columns": cols, "roles": roles, "src": src, "profile": dm.detect_profile(cols),
             "stats": {str(c): col_stats(df[c]) for c in df.columns},
             "guess": {c: mc.guess_role(c) for c in cols}}
 
@@ -344,6 +346,7 @@ class H(BaseHTTPRequestHandler):
             if u == "/api/profile":
                 roles = body["roles"]
                 name = mc.re.sub(r"\W+", "_", f"{Path(name_of(body['path'])).stem}_{body['sheet']}")[:40]
+                mc.remember(roles)  # header memory: next sheet pre-fills these decisions
                 mc.save_profile(mc.profile_from_roles(name, roles))
                 return self._send(200, {"saved": sum(r != "Not PHI" for r in roles.values()), "of": len(roles)})
             if u == "/api/run":
@@ -484,6 +487,7 @@ input[type=number]{width:92px}
 .cname span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .chev{width:7px;height:7px;border-right:2px solid var(--muted);border-bottom:2px solid var(--muted);transform:rotate(-45deg);transition:transform .2s var(--ease);flex:none;margin:0 3px}
 .open .chev{transform:rotate(45deg)}
+.newtag{font:500 11px var(--display);font-style:normal;letter-spacing:.05em;text-transform:uppercase;color:var(--accent);border:1px solid var(--accent);border-radius:99px;padding:0 7px}
 .flag{font:500 11.5px var(--display);font-style:normal;letter-spacing:.03em;color:var(--warn);border:1px solid var(--warn);border-radius:99px;padding:1px 8px;white-space:nowrap}
 .detail{padding:4px 6px 18px 24px;animation:rise .25s var(--ease)}
 @keyframes rise{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:none}}
@@ -557,7 +561,8 @@ const T="__TOKEN__",$=id=>document.getElementById(id);
 const api=(p,o={})=>fetch(p,{...o,headers:{"X-Token":T,"Content-Type":"application/json"}}).then(r=>r.json());
 const post=(p,b)=>api(p,{method:"POST",body:JSON.stringify(b||{})});
 let CUR="",rfile=null;const P=()=>CUR;function setPath(p,d){CUR=p;$("path").value=d||p;loadSheets()}
-let roles={},ROLES=[],timer=null,since=0,STATS={},OPEN=new Set(),PREV={};
+let roles={},ROLES=[],timer=null,since=0,STATS={},OPEN=new Set(),PREV={},SRC={};
+const known=()=>Object.keys(SRC).forEach(k=>SRC[k]="remembered");
 const esc=x=>String(x).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const HITLBL={phone:"phone numbers",email:"emails",ssn:"SSN-like",date:"dates",id:"long IDs",name:"name-like"};
 const ROLEHELP={"Not PHI":"Left exactly as it is.","Identifier":"Each value becomes a stable token.","Date":"Becomes days from the work date.","Free text":"Scanned with regex, Presidio and NER; anything found is replaced.","Drop":"Removed from the masked file."};
@@ -585,7 +590,7 @@ function renderCols(){
     const w=document.createElement("div"),open=OPEN.has(c);w.className="colwrap"+(open?" open":"");
     const d=document.createElement("div");d.className="col";
     const n=document.createElement("button");n.className="cname";n.setAttribute("aria-expanded",open);n.title=c;
-    n.innerHTML=`<i class="chev"></i><span>${esc(c)}</span>${flagged(c)?`<em class="flag" title="Marked Not PHI but ${sens(c)} cells look sensitive">${sens(c)} look sensitive</em>`:""}`;
+    n.innerHTML=`<i class="chev"></i><span>${esc(c)}</span>${SRC[c]==="guessed"?'<em class="newtag" title="Not seen before: role guessed from the name. Confirm it, then Save or Run to remember it.">new</em>':""}${flagged(c)?`<em class="flag" title="Marked Not PHI but ${sens(c)} cells look sensitive">${sens(c)} look sensitive</em>`:""}`;
     n.onclick=()=>{open?OPEN.delete(c):OPEN.add(c);if(!open)loadPrev(c);renderCols()};
     const g=document.createElement("div");g.className="seg";g.setAttribute("role","group");g.setAttribute("aria-label","Role for "+c);
     ROLES.forEach(r=>{const b=document.createElement("button");b.textContent=r;
@@ -595,15 +600,15 @@ function renderCols(){
     if(open){const x=document.createElement("div");x.className="detail";x.innerHTML=detail(c);w.appendChild(x)}
     box.appendChild(w)});
   box.scrollTop=st;
-  const all=Object.keys(roles),m=all.filter(c=>roles[c]!=="Not PHI").length,fl=all.filter(flagged).length;
-  $("count").textContent=all.length?`${m} of ${all.length} columns marked`+(fl?` · ${fl} unmarked look sensitive`:""):"No columns loaded";
+  const all=Object.keys(roles),m=all.filter(c=>roles[c]!=="Not PHI").length,fl=all.filter(flagged).length,nw=all.filter(c=>SRC[c]==="guessed").length;
+  $("count").textContent=all.length?`${m} of ${all.length} columns marked`+(nw?` · ${nw} new to review`:" · all remembered")+(fl?` · ${fl} unmarked look sensitive`:""):"No columns loaded";
 }
 async function loadCols(){
   $("err1").textContent="";
   const q=new URLSearchParams({path:P(),sheet:$("sheet").value});
   const r=await api("/api/columns?"+q);
   if(r.error){$("err1").textContent=r.error;return}
-  roles=r.roles;STATS=r.stats;PREV={};OPEN=new Set();
+  roles=r.roles;SRC=r.src||{};STATS=r.stats;PREV={};OPEN=new Set();
   const k=$("kind");k.style.display=r.profile?"inline-flex":"none";k.textContent=r.profile?("Detected: "+r.profile.replace("saved:","saved profile ")):"";
   renderCols();
 }
@@ -616,13 +621,13 @@ async function loadSheets(){
 $("browse").onclick=()=>$("file").click();
 $("path").onchange=()=>{CUR=$("path").value.trim();loadSheets()};$("sheet").onchange=loadCols;$("filter").oninput=renderCols;$("flagged").onchange=renderCols;
 $("save").onclick=async()=>{const r=await post("/api/profile",{path:P(),sheet:$("sheet").value,roles});
-  $("saved").className="state ok";$("saved").textContent=r.error?r.error:`Saved ${r.saved}/${r.of}`};
+  $("saved").className="state ok";$("saved").textContent=r.error?r.error:`Saved ${r.saved}/${r.of} · remembered`;if(!r.error){known();renderCols()}};
 $("open").onclick=()=>post("/api/open");
 $("quit").onclick=async()=>{await post("/api/quit");document.body.innerHTML='<main><h1>Stopped</h1><p class="sub">You can close this tab.</p></main>'};
 $("run").onclick=async()=>{
   const p=P();if(!p){$("err1").textContent="Pick a workbook first.";return}
   $("log").textContent="";since=0;$("state").textContent="";$("run").disabled=true;$("bar").classList.add("on");
-  if(Object.keys(roles).length){const m=await post("/api/profile",{path:p,sheet:$("sheet").value,roles});$("log").textContent=m.error?"":`Using the ${m.saved} column marks shown in Step 2 (saved).\n`}
+  if(Object.keys(roles).length){const m=await post("/api/profile",{path:p,sheet:$("sheet").value,roles});$("log").textContent=m.error?"":`Using the ${m.saved} column marks shown in Step 2 (saved and remembered).\n`;if(!m.error){known();renderCols()}}
   const r=await post("/api/run",{path:p,mode:$("mode").value,model:$("model").value,limit:+$("limit").value,presidio:$("presidio").checked,date:$("rdate").value});
   if(r.error){$("log").textContent=r.error;$("run").disabled=false;$("bar").classList.remove("on");return}
   timer=setInterval(poll,700);

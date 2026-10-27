@@ -29,6 +29,7 @@ from pathlib import Path
 
 import pandas as pd
 
+import headermem as hm
 import phi_scrub as ps
 
 SOURCE_DIR = Path(os.environ.get("AR_AUDIT_SOURCE_DIR", r"C:\Users\mick.harper\OneDrive - Anka"))
@@ -103,6 +104,8 @@ def detect_profile(cols):
     for name, p in allp.items():
         if p["detect"] <= set(cols):
             return name
+    if hm.coverage(cols) >= hm.COVERAGE:  # a new sheet made mostly of headers you have already decided on
+        return "memory"
     return None
 
 
@@ -114,7 +117,10 @@ def builtin_profile(cols):
     return None
 
 
-def get_profile(name):
+def get_profile(name, cols=None):
+    if name == "memory":
+        import mask_columns_logic as mcl
+        return hm.profile_from_memory(cols, mcl.guess_role, mcl.guess_kind)[0]
     return {**saved_profiles(), **PROFILES}[name]
 
 
@@ -160,7 +166,7 @@ def sweep(series, extra_names=None):
 
 
 def mask(df, prof, anchor, use_presidio):
-    p = get_profile(prof)
+    p = get_profile(prof, list(df.columns))
     out = df.drop(columns=[c for c in ps.DROP_COLS + p.get("drop", []) if c in df.columns]).copy()
     for col, kind in p["tokens"].items():
         if col in out.columns:
@@ -170,6 +176,11 @@ def mask(df, prof, anchor, use_presidio):
         if c in df.columns:
             out[c] = (pd.to_datetime(df[c], errors="coerce") - worked.dt.normalize()).dt.days
             out = out.rename(columns={c: f"{c} (days vs worked)"})
+    if prof == "memory":
+        import mask_columns_logic as mcl
+        guessed = hm.profile_from_memory(list(df.columns), mcl.guess_role, mcl.guess_kind)[1]
+        if guessed:
+            print(f"  NOTE: headers not in memory, role guessed from the name (review in the UI): {', '.join(map(str, guessed))}")
     text_cols = [c for c in p["text"] if c in df.columns]
     if use_presidio and text_cols:
         import presidio_layer as pl

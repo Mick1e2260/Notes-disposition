@@ -3,3 +3,6 @@
 *.csv
 scrub_out/
 __pycache__/
+
+header_memory.json
+column_profiles.json

@@ -44,6 +44,8 @@ def main():
     cmd, rest = (sys.argv[1], sys.argv[2:]) if len(sys.argv) > 1 else ("ui", [])
     import daily_mask as dm
     dm.PROFILE_FILE = BASE / "column_profiles.json"
+    import headermem
+    headermem.FILE = BASE / "header_memory.json"
     if cmd == "ui":
         import webui
         webui.main(network="--network" in rest)

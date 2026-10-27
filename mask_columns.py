@@ -25,39 +25,15 @@ from tkinter import filedialog, messagebox, ttk
 import pandas as pd
 
 import daily_mask as dm
+import headermem as hm
 
 ROLES = ["Not PHI", "Identifier", "Date", "Free text", "Drop"]
-KIND_GUESS = [("mrn|chart", "MRN"), (r"patient|\bpt\b|responsible|insured|subscriber|guarantor|^name|\bname$", "PAT"), ("claim", "CLM"),
-              ("bill", "BIL"), ("account|acct", "ACC"), ("provider|pro name|doctor|physician|rendering", "PRV"),
-              ("user|agent|submitted by|emp|assigned to|worked by", "USR")]
-DATE_HINT = r"date|\bdos\b|\bdob\b|birth|assigned on|submitted on|\bdue\b|cut-?off|visit|admit|discharge|service|\bdt\b"
-TEXT_HINT = r"notes?$|^notes? |description|reason|comment|remark|narrative|memo|detail"
-ID_HINT = (r"patient|\bpt\b|\bname\b|names?$|mrn|chart|claim (number|id|#|no)|bill id|\bacct\b|account|responsible|guarantor|"
-           r"member|subscriber|insured|policy|group #|ssn|social|\bdob\b|birth|phone|fax|mobile|email|address|street|zip|"
-           r"assigned user|submitted by|worked by|provider|pro name|physician|doctor|encounter|visit (id|no|#)|auth(orization)? (no|#|number)|"
-           r"\bicn\b|\bdcn\b|\bnpi\b|\bref(erence)? ?(no|#|number)")
-
-
-def guess_role(col):
-    """First-pass role from the header text; you confirm or change it in the UI."""
-    c = str(col).lower()
-    if re.search(DATE_HINT, c) and not re.search(r"updated|modified|refresh|\bage\b|aging|^days|touches|over due", c):
-        return "Date"
-    if re.search(TEXT_HINT, c):
-        return "Free text"
-    if re.search(ID_HINT, c):
-        return "Identifier"
-    return "Not PHI"
-
-
-def guess_kind(col):
-    c = str(col).lower()
-    return next((k for pat, k in KIND_GUESS if re.search(pat, c)), "ID")
+from mask_columns_logic import guess_kind, guess_role  # noqa: E402
 
 
 def profile_from_roles(name, roles):
     return {"name": name, "match": [c for c, r in roles.items() if r != "Not PHI"] or list(roles),
-            "tokens": {c: guess_kind(c) for c, r in roles.items() if r == "Identifier"},
+            "tokens": {c: hm.kind_for(c, guess_kind) for c, r in roles.items() if r == "Identifier"},
             "dates": [c for c, r in roles.items() if r == "Date"],
             "text": [c for c, r in roles.items() if r == "Free text"],
             "drop": [c for c, r in roles.items() if r == "Drop"]}
@@ -70,15 +46,12 @@ def save_profile(profile):
 
 
 def saved_roles(cols):
-    """Pre-fill from an existing saved profile for these headers, else from header-name guesses."""
-    if dm.PROFILE_FILE.exists():
-        for p in json.loads(dm.PROFILE_FILE.read_text(encoding="utf-8")).get("profiles", []):
-            if set(p["match"]) <= set(cols):
-                m = {c: "Identifier" for c in p.get("tokens", {})}
-                m.update({c: "Date" for c in p.get("dates", [])}); m.update({c: "Free text" for c in p.get("text", [])})
-                m.update({c: "Drop" for c in p.get("drop", [])})
-                return {c: m.get(c, "Not PHI") for c in cols}
-    return {c: guess_role(c) for c in cols}
+    """Pre-fill from header memory (what you decided before), else from header-name guesses."""
+    return hm.role_map(cols, guess_role, guess_kind)[0]
+
+
+def remember(roles):
+    hm.remember(roles, lambda c: hm.kind_for(c, guess_kind))
 
 
 class App(tk.Tk):
@@ -130,6 +103,7 @@ class App(tk.Tk):
             return
         roles = {c: v.get() for c, v in self.vars.items()}
         name = re.sub(r"\W+", "_", f"{self.path.stem}_{self.sheet.get()}")[:40]
+        remember(roles)
         save_profile(profile_from_roles(name, roles))
         marked = sum(r != "Not PHI" for r in roles.values())
         if run:

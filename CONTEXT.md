@@ -220,3 +220,10 @@ LLM must be checked against the QA answer key (roadmap step 1) before it is trus
   values using every `REID KEY` in the private dir; the restored file is built in memory and streamed to the browser, never saved.
   Date columns and `[D-n]` tokens are rebuilt from the work date (file-name date or the date field) as MM/DD/YYYY. Not recoverable:
   dropped columns, `[DATE]` (far-off dates such as DOB), quarantined rows; name case variants return in first-seen form.
+
+### Header memory (`headermem.py`, `header_memory.json`)
+Every header you mark (Save, or Run) is remembered globally: role plus token kind, matched after normalising case, spaces and
+punctuation. A new sheet pre-fills remembered headers and tags only unseen ones "new" for review. If a sheet matches no saved or
+built-in profile but 70%+ of its headers are remembered, `daily_mask.py` masks it with no UI (unseen headers are guessed from the name
+and listed in the log). Below 70% it refuses rather than guess. The file holds headers/roles only, no data; it is gitignored.
+`mask_columns_logic.py` holds the header-name guesses (no GUI dependency).
