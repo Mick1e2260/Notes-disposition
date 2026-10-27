@@ -6,7 +6,7 @@ Single entry point (also what the .exe runs).
   ar_audit mask [file ...]    mask workbook(s)          (extra flags: --date, --no-presidio)
   ar_audit review [masked]    note-vs-disposition LLM review of a masked audit-result workbook
   ar_audit classify [masked]  LLM classification of a masked Open AR inventory workbook
-  ui                          browser UI on 127.0.0.1 (default with no command): file, mark PHI columns, run, live log
+  ui [--network]              browser UI (default with no command). --network serves it on this PC's LAN address with a secret key
   classic                     the older plain desktop window (Tk)
   help                        prints this help
 
@@ -46,7 +46,7 @@ def main():
     dm.PROFILE_FILE = BASE / "column_profiles.json"
     if cmd == "ui":
         import webui
-        webui.main()
+        webui.main(network="--network" in rest)
     elif cmd in ("classic", "gui"):
         import gui
         gui.main()

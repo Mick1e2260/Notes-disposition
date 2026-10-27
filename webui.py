@@ -8,10 +8,12 @@ Only headers are ever read for the page; the log shows counts, never cell data.
 """
 import contextlib
 import io
+import ipaddress
 import json
 import os
 import re
 import secrets
+import socket
 import subprocess
 import threading
 import webbrowser
@@ -28,7 +30,9 @@ import mask_columns as mc
 import phi_scrub as ps
 import reidentify
 
-TOKEN = secrets.token_urlsafe(16)
+TOKEN = secrets.token_urlsafe(16)  # replaced by a persistent key in main() so the link stays the same between runs
+ALLOWED_HOSTS = {"127.0.0.1", "localhost"}
+SERVER_IP = {"ip": None}  # this PC's LAN address when running in network mode
 JOB = {"lines": [], "done": True, "ok": True, "running": False}
 LOCK = threading.Lock()
 ROLES = mc.ROLES
@@ -216,9 +220,23 @@ class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    def _client(self):
+        try:
+            ip = ipaddress.ip_address(self.client_address[0].split("%")[0])
+            return getattr(ip, "ipv4_mapped", None) or ip
+        except ValueError:
+            return None
+
     def _ok(self):
-        host = (self.headers.get("Host") or "").split(":")[0]
-        return host in ("127.0.0.1", "localhost")
+        """Loopback or private-network clients only, and only for Host names this server was started with."""
+        host = (self.headers.get("Host") or "").split(":")[0].lower()
+        ip = self._client()
+        return host in ALLOWED_HOSTS and ip is not None and (ip.is_loopback or ip.is_private)
+
+    def _local_client(self):
+        """The person sitting at this PC (loopback, or this PC reaching itself through its LAN address)."""
+        ip = self._client()
+        return ip is not None and (ip.is_loopback or str(ip) == SERVER_IP["ip"])
 
     def _send(self, code, body, ctype="application/json"):
         b = body if isinstance(body, bytes) else json.dumps(body).encode()
@@ -247,6 +265,8 @@ class H(BaseHTTPRequestHandler):
         if not self._ok():
             return self._send(403, {"error": "bad host"})
         if u.path == "/":
+            if parse_qs(u.query).get("k", [""])[0] != TOKEN:
+                return self._send(403, b"<h3>Open the link printed by the launcher (it ends with ?k=...).</h3>", "text/html")
             return self._send(200, PAGE.replace("__TOKEN__", TOKEN).encode(), "text/html")
         if self.headers.get("X-Token") != TOKEN:
             return self._send(403, {"error": "bad token"})
@@ -295,6 +315,8 @@ class H(BaseHTTPRequestHandler):
                 UPLOADS[uid] = (name, raw)
                 return self._send(200, {"path": "mem:" + uid, "name": name})
             if u == "/api/restore":
+                if not self._local_client():
+                    return self._send(403, {"error": "Restore is only available from the PC that runs AR Audit"})
                 known = {o["name"] for o in outputs()}
                 src = raw if raw else ((dm.MASKED_DIR / qs["out"]).read_bytes() if qs.get("out") in known else None)
                 if src is None:
@@ -333,11 +355,53 @@ class H(BaseHTTPRequestHandler):
         self._send(404, {"error": "not found"})
 
 
-def main():
-    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
-    url = f"http://127.0.0.1:{srv.server_address[1]}/"
-    print(f"AR Audit running at {url}  (close this window or press Quit in the page to stop)", flush=True)
-    webbrowser.open(url)
+def lan_ip():
+    """This PC's LAN address (no packet is sent; the OS just picks the outgoing interface)."""
+    c = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        c.connect(("10.255.255.255", 1))
+        return c.getsockname()[0]
+    except OSError:
+        return socket.gethostbyname(socket.gethostname())
+    finally:
+        c.close()
+
+
+def persistent_key():
+    """A secret kept in the private dir so the link (and bookmarks) survive restarts."""
+    dm.private_setup()
+    f = dm.PRIVATE_DIR / "ui_key.txt"
+    if not f.exists():
+        f.write_text(secrets.token_urlsafe(18))
+    return f.read_text().strip()
+
+
+def main(network=False, port=8765):
+    global TOKEN
+    TOKEN = persistent_key()
+    host, ip = ("0.0.0.0", lan_ip()) if network else ("127.0.0.1", None)
+    ALLOWED_HOSTS.update({ip, socket.gethostname().lower(), socket.getfqdn().lower()} - {None})
+    SERVER_IP["ip"] = ip
+    srv = None
+    for pt in list(range(port, port + 10)) + [0]:  # stable port when free, else the next one
+        try:
+            srv = ThreadingHTTPServer((host, pt), H)
+            break
+        except OSError:
+            continue
+    pt = srv.server_address[1]
+    local = f"http://127.0.0.1:{pt}/?k={TOKEN}"
+    print("AR Audit is running. Close this window or press Quit in the page to stop.", flush=True)
+    if network:
+        link = f"http://{ip}:{pt}/?k={TOKEN}"
+        print(f"  Network link : {link}", flush=True)
+        print(f"  This PC only : {local}", flush=True)
+        print("  The link holds a secret key: share it only with people allowed to see masked data.", flush=True)
+        print("  Restore (original values) works only from this PC. If Windows asks, allow access on Private networks.", flush=True)
+        webbrowser.open(link)
+    else:
+        print(f"  Link : {local}", flush=True)
+        webbrowser.open(local)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
