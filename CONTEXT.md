@@ -155,6 +155,39 @@ Grid Violations (derived status × action) · Derived Status · Client View · F
 
 ---
 
+### Daily mask (`daily_mask.py`)
+Reads the newest `AR Audit Result*.xlsx` from OneDrive **in memory only** (no copy of the source is written), tokenises
+Unique ID / Agent / Emp ID, scrubs notes via `phi_scrub.py`, then sweeps every masked value out of all other notes.
+Outputs `masked_out\… - MASKED.xlsx` (the only file an LLM may see) and `… - QUARANTINE.xlsx` (never sent). The salt,
+the token→value REID KEY and a counts-only run log sit in `%LOCALAPPDATA%\AnkaARAudit\private` (current-user ACL).
+`run_daily.ps1` runs it; the scheduling command is in its header. Salt comes from `AR_AUDIT_SALT` or that private dir.
+
+### LLM review (`llm_audit.py`, `llm_context.md`)
+Local Ollama, model `qwen2.5:7b-instruct` (CPU-only PC: i3-12100, 15.7 GB RAM, ~17 s/claim). Reads only the `- MASKED`
+file, re-runs the residual-PHI scan per note, and refuses non-loopback Ollama hosts. Reviews every claim the rules engine
+flagged on N01/N03/N04/N05/G01 plus a 10% control sample, and returns schema-constrained JSON
+`{note_status, note_action, verdict, confidence, reason}`. `llm_context.md` is the plain-language brief given to the model
+(edit it to tune behaviour). Output `masked_out\… - LLM REVIEW.xlsx` compares the LLM to the rules engine:
+Confirmed / Possible false positive / NEW finding / Unclear. Advisory only: QA confirms before agent feedback, and the
+LLM must be checked against the QA answer key (roadmap step 1) before it is trusted. Override with `--model` / `AR_AUDIT_MODEL`.
+
+### Presidio + NER layer, column marking, inventory classifier (added 27-Oct-2026)
+- **Mark PHI columns once:** `python mask_columns.py` opens a small window: pick the workbook and sheet, then set each
+  column header to Not PHI / Identifier (token) / Date (day offset) / Free text (scan) / Drop. Only headers are read.
+  Saved to `column_profiles.json` (headers + roles, no data); `daily_mask.py` applies it to every sheet with those headers.
+  Columns marked Not PHI are left alone; `daily_mask.py` warns if one looks like SSN/phone/email. Without a saved profile
+  the built-in sheet types are used (Open AR inventory, WFM aging, audit result).
+- **Free-text masking order:** `phi_scrub` regex rules -> `presidio_layer.py` (Presidio recognizers + spaCy NER; custom MRN and
+  AR-ID recognizers; payer/client names on an allow-list) -> sweep (a value masked once is masked everywhere, any case; patient
+  names from the name column also catch "First Last" and name parts). NER: `AR_AUDIT_NER=spacy` (default, `AR_AUDIT_SPACY`
+  model) or `hf` (clinical de-id transformer, `AR_AUDIT_HF_MODEL`, downloaded once, not yet tested here).
+  Dates far from the work date (e.g. DOB) become `[DATE]` rather than an offset that would reveal age.
+- **Classifier:** `llm_classify.py` reads the masked inventory sheet, has local Qwen predict claim status / action / denial
+  category from the masked Notes + denial text (labels taken from the sheet itself), and flags rows where the prediction differs
+  from what the agent entered (`... - CLASSIFIED.xlsx`). Advisory, QA confirms.
+- Tested on a synthetic inventory workbook (fake patients) and on the 23-Oct audit result (strict leak check: 0 originals left).
+  Presidio/NER accuracy on real notes is not benchmarked; compliance sign-off is still required.
+
 ## 7. Roadmap
 
 1. **Calibrate (week 1):** QA manually audits about 50 fatal flags plus clean samples. Tune regexes to at least 90% precision, then lock which codes are fatal.

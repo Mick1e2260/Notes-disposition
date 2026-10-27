@@ -1,0 +1,8 @@
+pandas
+openpyxl
+presidio-analyzer
+presidio-anonymizer
+spacy
+# python -m spacy download en_core_web_sm     (or en_core_web_lg for better NER)
+# optional clinical de-id transformer NER: pip install transformers torch ; set AR_AUDIT_NER=hf
+# Ollama + model:  ollama pull qwen2.5:7b-instruct

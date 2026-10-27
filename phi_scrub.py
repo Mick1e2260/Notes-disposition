@@ -22,6 +22,7 @@ Have compliance sign off on the method and on a reviewed sample before using
 any cloud service without a BAA.
 """
 import hashlib
+import os
 import re
 import sys
 from datetime import datetime
@@ -29,10 +30,10 @@ from pathlib import Path
 
 import pandas as pd
 
-SRC = Path(sys.argv[1])
-OUT_DIR = Path(sys.argv[2]) if len(sys.argv) > 2 else SRC.parent
 NOTES = "Notes (PHI Safe"
-SALT = "anka-ar-audit"  # change and keep private; same salt -> stable tokens across days
+# Private salt, same salt -> stable tokens across days. Never hardcode: set env AR_AUDIT_SALT
+# (daily_mask.py generates and stores one outside the repo on first run).
+SALT = os.environ.get("AR_AUDIT_SALT", "CHANGE-ME")
 
 # Columns that carry identifiers and are not needed by an AI reviewer
 DROP_COLS = ["Representative Name", "Call Reference #", "Portal Reference #", "Insurance Phone"]
@@ -80,6 +81,9 @@ SUBS = [
 KEEP = re.compile(r"^(?:(?:CPT|HCPCS|DX|ICD|CO|PR|OA|PI|MOD)[-:# ]*)?(?:\d{4}[0-9FTU]|[A-V]\d{4}|[A-Z]\d{2}(?:\.\w{1,4})?|\d{1,3}(?:\.\d+)?)$", re.I)
 
 
+TOKEN_RX = re.compile(r"(\[(?:[A-Z]+-[0-9A-F]{6}|D[+-]\d+|DATE)\])")  # odd-indexed items after split() are tokens
+
+
 def shift_dates(text, worked):
     def repl(m):
         try:
@@ -90,7 +94,8 @@ def shift_dates(text, worked):
                 d = datetime.strptime(f"{m.group(4)[:3]} {m.group(5)} {m.group(6)}", "%b %d %Y")
         except ValueError:
             return "[DATE]"
-        return f"[D{(d - worked).days:+d}]"
+        days = (d - worked).days
+        return f"[D{days:+d}]" if abs(days) <= 1100 else "[DATE]"  # far-off dates (DOB etc.) would reveal age
     return DATE_RX.sub(repl, text)
 
 
@@ -100,9 +105,13 @@ def scrub_note(text, worked):
     t = SUBSCRIBER_NAME.sub(lambda m: m.group(1) + token("NAME", m.group(2)), t)
     t = UPPER_NAME.sub(lambda m: token("NAME", m.group(0)), t)
     t = NAME_TRIGGER.sub(lambda m: f"{m.group(1)} {token('NAME', m.group(2))}", t)
+    # never re-scan our own tokens (the ID rule would match e.g. NAME-12345A inside [NAME-12345A])
+    parts = TOKEN_RX.split(t)
     for kind, rx in SUBS:
-        t = rx.sub(lambda m, k=kind: m.group(0) if KEEP.match(m.group(0)) else token(k, m.group(0)), t)
-    return t
+        parts = [p if i % 2 else rx.sub(lambda m, k=kind: m.group(0) if KEEP.match(m.group(0)) else token(k, m.group(0)), p)
+                 for i, p in enumerate(parts)]
+        parts = TOKEN_RX.split("".join(parts))
+    return "".join(parts)
 
 
 # --- residual-risk scan: anything here sends the row to quarantine --------
@@ -121,6 +130,8 @@ def residual(t):
 
 
 def main():
+    SRC = Path(sys.argv[1])
+    OUT_DIR = Path(sys.argv[2]) if len(sys.argv) > 2 else SRC.parent
     df = pd.read_excel(SRC, sheet_name=0)
     out = df.drop(columns=[c for c in DROP_COLS if c in df.columns]).copy()
     worked = pd.to_datetime(df["Worked Date"])
