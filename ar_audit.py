@@ -6,7 +6,9 @@ Single entry point (also what the .exe runs).
   ar_audit mask [file ...]    mask workbook(s)          (extra flags: --date, --no-presidio)
   ar_audit review [masked]    note-vs-disposition LLM review of a masked audit-result workbook
   ar_audit classify [masked]  LLM classification of a masked Open AR inventory workbook
-  (no command)                prints this help
+  ui                          browser UI on 127.0.0.1 (default with no command): file, mark PHI columns, run, live log
+  classic                     the older plain desktop window (Tk)
+  help                        prints this help
 
 Next to the exe, keep llm_context.md (editable brief for the model) and column_profiles.json (your saved column marks).
 """
@@ -39,10 +41,23 @@ def run(mod_main, argv):
 
 
 def main():
-    cmd, rest = (sys.argv[1], sys.argv[2:]) if len(sys.argv) > 1 else ("help", [])
+    cmd, rest = (sys.argv[1], sys.argv[2:]) if len(sys.argv) > 1 else ("ui", [])
     import daily_mask as dm
     dm.PROFILE_FILE = BASE / "column_profiles.json"
-    if cmd == "mark":
+    if cmd == "ui":
+        import webui
+        webui.main()
+    elif cmd in ("classic", "gui"):
+        import gui
+        gui.main()
+    elif cmd == "pick":  # native file dialog, used by the browser UI's Browse button
+        import tkinter as tk
+        from tkinter import filedialog
+        r = tk.Tk()
+        r.withdraw()
+        r.attributes("-topmost", True)
+        print(filedialog.askopenfilename(initialdir=dm.SOURCE_DIR, filetypes=[("Excel", "*.xlsx *.xlsm")]))
+    elif cmd == "mark":
         import mask_columns as mc
         mc.App(rest[0] if rest else None).mainloop()
     elif cmd == "mask":
