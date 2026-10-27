@@ -8,6 +8,7 @@ Single entry point (also what the .exe runs).
   ar_audit classify [masked]  LLM classification of a masked Open AR inventory workbook
   ui [--network]              browser UI (default with no command). --network serves it on this PC's LAN address with a secret key
   classic                     the older plain desktop window (Tk)
+  doctor                      check Python/libraries/Ollama/model/folders/port/network and print what is wrong
   help                        prints this help
 
 Next to the exe, keep llm_context.md (editable brief for the model) and column_profiles.json (your saved column marks).
@@ -52,6 +53,9 @@ def main():
     elif cmd in ("classic", "gui"):
         import gui
         gui.main()
+    elif cmd == "doctor":
+        import doctor
+        doctor.main()
     elif cmd == "pick":  # native file dialog, used by the browser UI's Browse button
         import tkinter as tk
         from tkinter import filedialog
