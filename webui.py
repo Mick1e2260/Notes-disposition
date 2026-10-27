@@ -1,4 +1,4 @@
-﻿"""
+"""
 Local web UI (default). Serves one page on 127.0.0.1 only and opens it in your browser. No external fonts, scripts or
 requests: the page and API live in this process. Every API call needs a per-run token and a loopback Host header.
 
@@ -9,6 +9,7 @@ Only headers are ever read for the page; the log shows counts, never cell data.
 import io
 import json
 import os
+import re
 import secrets
 import subprocess
 import threading
@@ -22,6 +23,7 @@ import pandas as pd
 import daily_mask as dm
 import gui
 import mask_columns as mc
+import phi_scrub as ps
 
 TOKEN = secrets.token_urlsafe(16)
 JOB = {"lines": [], "done": True, "ok": True, "running": False}
@@ -38,9 +40,75 @@ def sheets_of(path):
     return pd.ExcelFile(io.BytesIO(Path(path).read_bytes())).sheet_names
 
 
+_DF = {}  # (path, mtime, sheet) -> DataFrame, memory only (never written to disk)
+PATTERNS = {
+    "phone": re.compile(r"\(?\b\d{3}\)?[\s.-]\d{3}[\s.-]\d{4}\b"),
+    "email": re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+"),
+    "ssn": re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),
+    "date": re.compile(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b"),
+    "id": re.compile(r"\b(?=[A-Z0-9-]*\d[A-Z0-9-]*\d[A-Z0-9-]*\d[A-Z0-9-]*\d[A-Z0-9-]*\d)[A-Z0-9][A-Z0-9-]{5,}\b", re.I),
+    "name": re.compile(r"\b[A-Z][a-z]+,? [A-Z][a-z]+\b|\b[A-Z]{2,}, [A-Z]{2,}\b"),
+}
+
+
+def frame(path, sheet):
+    p = Path(path)
+    key = (str(p), p.stat().st_mtime, sheet)
+    if key not in _DF:
+        _DF.clear()
+        _DF[key] = pd.read_excel(io.BytesIO(p.read_bytes()), sheet)
+    return _DF[key]
+
+
+def shape(v):
+    return re.sub(r"[a-z]", "a", re.sub(r"[A-Z]", "A", re.sub(r"\d", "9", str(v)[:28])))
+
+
+def col_stats(s):
+    """Facts about a column that do not reveal its values: fill, distinct, type, pattern hits, value shapes."""
+    nn = s.dropna()
+    txt = nn.astype(str)
+    out = {"rows": int(len(s)), "filled": round(len(nn) / max(len(s), 1) * 100), "distinct": int(nn.nunique()),
+           "type": "date" if pd.api.types.is_datetime64_any_dtype(s) else "number" if pd.api.types.is_numeric_dtype(s) else "text",
+           "avg_len": int(txt.str.len().mean()) if len(txt) else 0}
+    out["hits"] = {k: int(txt.str.contains(rx).sum()) for k, rx in PATTERNS.items()} if out["type"] == "text" else {}
+    out["hits"] = {k: v for k, v in out["hits"].items() if v}
+    out["shapes"] = [[k, int(v)] for k, v in txt.map(shape).value_counts().head(3).items()] if out["type"] != "number" else []
+    return out
+
+
 def columns_of(path, sheet):
-    cols = [str(c) for c in pd.read_excel(io.BytesIO(Path(path).read_bytes()), sheet, nrows=0).columns]
-    return {"columns": cols, "roles": mc.saved_roles(cols), "profile": dm.detect_profile(cols)}
+    df = frame(path, sheet)
+    cols = [str(c) for c in df.columns]
+    return {"columns": cols, "roles": mc.saved_roles(cols), "profile": dm.detect_profile(cols),
+            "stats": {str(c): col_stats(df[c]) for c in df.columns},
+            "guess": {c: mc.guess_role(c) for c in cols}}
+
+
+def preview(path, sheet, col, role):
+    """What the first 3 filled cells become under `role` (masked output only; Not PHI shows the value as-is)."""
+    df = frame(path, sheet)
+    anchor = dm.anchor_date(Path(path), None)
+    ps.SALT = dm.private_setup()
+    k0 = len(ps.key_rows)
+    out = []
+    try:
+        for v in df[col].dropna().head(3):
+            if role == "Identifier":
+                out.append(ps.token(mc.guess_kind(col), v))
+            elif role == "Date":
+                d = pd.to_datetime(v, errors="coerce")
+                out.append("unreadable date" if pd.isna(d) else f"{(d - pd.Timestamp(anchor)).days:+d} days from work date")
+            elif role == "Free text":
+                import presidio_layer as pl
+                out.append(pl.presidio_scrub(ps.scrub_note(str(v), anchor)))
+            elif role == "Drop":
+                out.append("column removed from the masked file")
+            else:
+                out.append(str(v))
+    finally:
+        del ps.key_rows[k0:]  # previews must not leak into a real run's key
+    return out
 
 
 def resolve_mode(path, mode):
@@ -118,6 +186,8 @@ class H(BaseHTTPRequestHandler):
                 return self._send(200, {"sheets": sheets_of(q["path"])})
             if u.path == "/api/columns":
                 return self._send(200, columns_of(q["path"], q["sheet"]))
+            if u.path == "/api/preview":
+                return self._send(200, {"preview": preview(q["path"], q["sheet"], q["col"], q["role"])})
             if u.path == "/api/job":
                 since = int(q.get("since", 0))
                 with LOCK:
@@ -214,8 +284,7 @@ button.primary:hover{filter:brightness(1.08)}button:disabled{opacity:.5;cursor:d
 button.quiet{border-color:transparent;background:none;color:var(--muted)}
 .cols{max-height:340px;overflow:auto;border-top:1px solid var(--line);margin-top:12px}
 .col{display:grid;grid-template-columns:1fr auto;gap:12px;align-items:center;padding:7px 2px;border-bottom:1px solid var(--line)}
-.col span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-@media(max-width:700px){.col{grid-template-columns:1fr;gap:5px;padding:10px 2px}.seg{width:100%}.seg button{flex:1;padding:0 4px}}
+@media(max-width:700px){.col{grid-template-columns:1fr;gap:5px;padding:10px 2px}.seg{width:100%}.seg button{flex:1;padding:0 4px}.detail{padding-left:8px}.dgrid{grid-template-columns:repeat(2,1fr)}}
 .seg{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
 .seg button{border:0;border-radius:0;min-height:30px;padding:0 11px;font:500 12.5px var(--body);background:none;color:var(--muted);border-right:1px solid var(--line)}
 .seg button:last-child{border-right:0}
@@ -232,6 +301,24 @@ input[type=number]{width:92px}
 .state{font:600 13px var(--display);letter-spacing:.04em}
 .state.ok{color:var(--good)}.state.fail{color:var(--bad)}
 .err{color:var(--bad);font-size:13.5px;margin-top:8px}
+.colwrap{border-bottom:1px solid var(--line)}.colwrap .col{border-bottom:0}
+.cname{all:unset;box-sizing:border-box;display:flex;align-items:center;gap:9px;min-height:32px;cursor:pointer;min-width:0;border-radius:6px;padding:2px 4px}
+.cname:hover{background:var(--accent-soft)}.cname:focus-visible{outline:3px solid var(--accent-soft);outline-offset:1px}
+.cname span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.chev{width:7px;height:7px;border-right:2px solid var(--muted);border-bottom:2px solid var(--muted);transform:rotate(-45deg);transition:transform .2s var(--ease);flex:none;margin:0 3px}
+.open .chev{transform:rotate(45deg)}
+.flag{font:500 11.5px var(--display);font-style:normal;letter-spacing:.03em;color:var(--warn);border:1px solid var(--warn);border-radius:99px;padding:1px 8px;white-space:nowrap}
+.detail{padding:4px 6px 18px 24px;animation:rise .25s var(--ease)}
+@keyframes rise{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:none}}
+.detail h4{font:600 12px var(--display);letter-spacing:.07em;text-transform:uppercase;color:var(--muted);margin:16px 0 6px}
+.dgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;max-width:420px}
+.dgrid b{display:block;font:600 18px var(--display)}.dgrid small{color:var(--muted);font-size:12px}
+.tags{display:flex;gap:6px;flex-wrap:wrap}.tag{font-size:12.5px;padding:2px 9px;border-radius:99px;background:var(--accent-soft)}
+.tag.warn{background:none;border:1px solid var(--warn);color:var(--warn)}
+.muted{color:var(--muted);font-size:13px;margin:0}.warn-t{color:var(--warn);font-size:13px;margin:8px 0 0}
+.shapes div{display:flex;gap:14px;align-items:baseline;font-size:13px;color:var(--muted)}
+code{font:12.5px var(--mono)}.pv{display:grid;gap:5px;margin-top:6px}
+.pv code{background:var(--log-bg);color:var(--log-ink);padding:6px 10px;border-radius:6px;white-space:pre-wrap;word-break:break-word}
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style></head><body><main>
 <header>
@@ -249,7 +336,7 @@ input[type=number]{width:92px}
 <section><div class="step">Step 2</div><div>
   <h2>Which columns contain PHI</h2>
   <p class="hint">Mark by header, once per report type. Columns left as “Not PHI” are not touched, so mark anything with patient or staff details.</p>
-  <div class="row"><input type="text" id="filter" placeholder="Filter headers" style="max-width:260px;flex:none"></div>
+  <div class="row"><input type="text" id="filter" placeholder="Filter headers" style="max-width:260px;flex:none"><label class="chk"><input type="checkbox" id="flagged"> Only flagged</label></div>
   <div class="cols" id="cols"></div>
   <div class="meta"><span id="count">No columns loaded</span><span class="row"><span class="state" id="saved"></span><button id="save">Save marks</button></span></div>
 </div></section>
@@ -273,27 +360,54 @@ input[type=number]{width:92px}
 const T="__TOKEN__",$=id=>document.getElementById(id);
 const api=(p,o={})=>fetch(p,{...o,headers:{"X-Token":T,"Content-Type":"application/json"}}).then(r=>r.json());
 const post=(p,b)=>api(p,{method:"POST",body:JSON.stringify(b||{})});
-let roles={},ROLES=[],timer=null,since=0;
-
+let roles={},ROLES=[],timer=null,since=0,STATS={},OPEN=new Set(),PREV={};
+const esc=x=>String(x).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const HITLBL={phone:"phone numbers",email:"emails",ssn:"SSN-like",date:"dates",id:"long IDs",name:"name-like"};
+const ROLEHELP={"Not PHI":"Left exactly as it is.","Identifier":"Each value becomes a stable token.","Date":"Becomes days from the work date.","Free text":"Scanned with regex, Presidio and NER; anything found is replaced.","Drop":"Removed from the masked file."};
+const sens=c=>Object.entries((STATS[c]||{}).hits||{}).filter(([k])=>k!=="date").reduce((a,[,v])=>a+v,0);
+const flagged=c=>roles[c]==="Not PHI"&&sens(c)>0;
+function detail(c){
+  const s=STATS[c]||{},role=roles[c],pv=PREV[c+"|"+role];
+  const hits=Object.entries(s.hits||{}).map(([k,v])=>`<span class="tag ${role==="Not PHI"&&k!=="date"?"warn":""}">${v} ${HITLBL[k]}</span>`).join("")||'<span class="muted">No phone, email, SSN, ID or name patterns found.</span>';
+  const shapes=(s.shapes||[]).map(([k,v])=>`<div><code>${esc(k)}</code><span>${v} cells</span></div>`).join("");
+  const dnote=role==="Not PHI"&&s.type==="date"?'<p class="warn-t">Dates tied to a patient count as PHI under Safe Harbor. Consider “Date”.</p>':"";
+  return `<div class="dgrid"><div><b>${s.filled}%</b><small>filled</small></div><div><b>${s.distinct}</b><small>distinct</small></div><div><b>${s.type}</b><small>type</small></div><div><b>${s.avg_len}</b><small>avg length</small></div></div>
+  <h4>Looks like</h4><div class="tags">${hits}</div>${dnote}
+  ${shapes?`<h4>Common value shapes</h4><div class="shapes">${shapes}</div>`:""}
+  <h4>After masking as “${esc(role)}”</h4><p class="muted">${ROLEHELP[role]}</p>
+  <div class="pv">${pv?pv.map(x=>`<code>${esc(x)}</code>`).join(""):'<span class="muted">Loading…</span>'}</div>`;
+}
+async function loadPrev(c){
+  const role=roles[c],k=c+"|"+role;if(PREV[k])return;
+  const r=await api("/api/preview?"+new URLSearchParams({path:$("path").value.trim(),sheet:$("sheet").value,col:c,role}));
+  PREV[k]=r.error?[r.error]:r.preview;renderCols();
+}
 function renderCols(){
-  const f=$("filter").value.toLowerCase(),box=$("cols");box.innerHTML="";
-  Object.keys(roles).filter(c=>c.toLowerCase().includes(f)).forEach(c=>{
+  const f=$("filter").value.toLowerCase(),only=$("flagged").checked,box=$("cols"),st=box.scrollTop;box.innerHTML="";
+  Object.keys(roles).filter(c=>c.toLowerCase().includes(f)&&(!only||flagged(c))).forEach(c=>{
+    const w=document.createElement("div"),open=OPEN.has(c);w.className="colwrap"+(open?" open":"");
     const d=document.createElement("div");d.className="col";
-    const s=document.createElement("span");s.textContent=c;s.title=c;
+    const n=document.createElement("button");n.className="cname";n.setAttribute("aria-expanded",open);n.title=c;
+    n.innerHTML=`<i class="chev"></i><span>${esc(c)}</span>${flagged(c)?`<em class="flag" title="Marked Not PHI but ${sens(c)} cells look sensitive">${sens(c)} look sensitive</em>`:""}`;
+    n.onclick=()=>{open?OPEN.delete(c):OPEN.add(c);if(!open)loadPrev(c);renderCols()};
     const g=document.createElement("div");g.className="seg";g.setAttribute("role","group");g.setAttribute("aria-label","Role for "+c);
     ROLES.forEach(r=>{const b=document.createElement("button");b.textContent=r;
       b.className=(roles[c]===r?"sel ":"")+(r==="Drop"?"drop":"");b.setAttribute("aria-pressed",roles[c]===r);
-      b.onclick=()=>{roles[c]=r;$("saved").textContent="";renderCols()};g.appendChild(b)});
-    d.append(s,g);box.appendChild(d)});
-  const n=Object.values(roles).filter(r=>r!=="Not PHI").length;
-  $("count").textContent=Object.keys(roles).length?`${n} of ${Object.keys(roles).length} columns marked`:"No columns loaded";
+      b.onclick=()=>{roles[c]=r;$("saved").textContent="";if(OPEN.has(c))loadPrev(c);renderCols()};g.appendChild(b)});
+    d.append(n,g);w.appendChild(d);
+    if(open){const x=document.createElement("div");x.className="detail";x.innerHTML=detail(c);w.appendChild(x)}
+    box.appendChild(w)});
+  box.scrollTop=st;
+  const all=Object.keys(roles),m=all.filter(c=>roles[c]!=="Not PHI").length,fl=all.filter(flagged).length;
+  $("count").textContent=all.length?`${m} of ${all.length} columns marked`+(fl?` · ${fl} unmarked look sensitive`:""):"No columns loaded";
 }
 async function loadCols(){
   $("err1").textContent="";
   const q=new URLSearchParams({path:$("path").value.trim(),sheet:$("sheet").value});
   const r=await api("/api/columns?"+q);
   if(r.error){$("err1").textContent=r.error;return}
-  roles=r.roles;const k=$("kind");k.style.display=r.profile?"inline-flex":"none";k.textContent=r.profile?("Detected: "+r.profile.replace("saved:","saved profile ")):"";
+  roles=r.roles;STATS=r.stats;PREV={};OPEN=new Set();
+  const k=$("kind");k.style.display=r.profile?"inline-flex":"none";k.textContent=r.profile?("Detected: "+r.profile.replace("saved:","saved profile ")):"";
   renderCols();
 }
 async function loadSheets(){
@@ -303,7 +417,7 @@ async function loadSheets(){
   $("sheet").innerHTML=r.sheets.map(s=>`<option>${s.replace(/</g,"&lt;")}</option>`).join("");loadCols();
 }
 $("browse").onclick=async()=>{const r=await post("/api/browse");if(r.path){$("path").value=r.path;loadSheets()}};
-$("path").onchange=loadSheets;$("sheet").onchange=loadCols;$("filter").oninput=renderCols;
+$("path").onchange=loadSheets;$("sheet").onchange=loadCols;$("filter").oninput=renderCols;$("flagged").onchange=renderCols;
 $("save").onclick=async()=>{const r=await post("/api/profile",{path:$("path").value.trim(),sheet:$("sheet").value,roles});
   $("saved").className="state ok";$("saved").textContent=r.error?r.error:`Saved ${r.saved}/${r.of}`};
 $("open").onclick=()=>post("/api/open");
