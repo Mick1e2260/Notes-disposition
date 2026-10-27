@@ -106,6 +106,14 @@ def detect_profile(cols):
     return None
 
 
+def builtin_profile(cols):
+    """Built-in sheet type only (inventory / wfm / audit), ignoring saved column marks."""
+    for name, p in PROFILES.items():
+        if p["detect"] <= set(cols):
+            return name
+    return None
+
+
 def get_profile(name):
     return {**saved_profiles(), **PROFILES}[name]
 

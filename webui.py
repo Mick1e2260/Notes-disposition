@@ -58,7 +58,7 @@ def name_of(path):
 def sheet_kind(path):
     xl = pd.ExcelFile(io.BytesIO(raw_of(path)))
     for n in xl.sheet_names:
-        k = dm.detect_profile(pd.read_excel(xl, n, nrows=0).columns)
+        k = dm.builtin_profile(pd.read_excel(xl, n, nrows=0).columns)
         if k:
             return k
 
@@ -164,12 +164,22 @@ def mask_uploaded(opts):
             dm.process(raw_of(path), name_of(path), dm.anchor_date(Path(name_of(path)), opts.get("date") or None),
                        opts.get("presidio", True))
         return True
-    except Exception as e:
-        say(f"Masking failed: {type(e).__name__}: {e}. Nothing was sent to the LLM.")
+    except BaseException as e:  # includes SystemExit raised for 'no matching sheet'
+        say(f"Masking failed: {e if isinstance(e, SystemExit) else type(e).__name__ + ': ' + str(e)}. Nothing was sent to the LLM.")
         return False
 
 
 def run_job(opts):
+    try:
+        _run_job(opts)
+    except BaseException as e:
+        say(f"Unexpected error: {type(e).__name__}: {e}")
+        JOB.update(ok=False)
+    finally:
+        JOB.update(done=True, running=False)
+
+
+def _run_job(opts):
     p = opts["path"]
     mem = str(p).startswith("mem:")
     try:
@@ -603,7 +613,7 @@ async function loadSheets(){
   if(r.error){$("err1").textContent="Cannot read that file: "+r.error;return}
   $("sheet").innerHTML=r.sheets.map(s=>`<option>${s.replace(/</g,"&lt;")}</option>`).join("");loadCols();
 }
-$("browse").onclick=async()=>{const r=await post("/api/browse");if(r.path)setPath(r.path)};
+$("browse").onclick=()=>$("file").click();
 $("path").onchange=()=>{CUR=$("path").value.trim();loadSheets()};$("sheet").onchange=loadCols;$("filter").oninput=renderCols;$("flagged").onchange=renderCols;
 $("save").onclick=async()=>{const r=await post("/api/profile",{path:P(),sheet:$("sheet").value,roles});
   $("saved").className="state ok";$("saved").textContent=r.error?r.error:`Saved ${r.saved}/${r.of}`};
@@ -612,6 +622,7 @@ $("quit").onclick=async()=>{await post("/api/quit");document.body.innerHTML='<ma
 $("run").onclick=async()=>{
   const p=P();if(!p){$("err1").textContent="Pick a workbook first.";return}
   $("log").textContent="";since=0;$("state").textContent="";$("run").disabled=true;$("bar").classList.add("on");
+  if(Object.keys(roles).length){const m=await post("/api/profile",{path:p,sheet:$("sheet").value,roles});$("log").textContent=m.error?"":`Using the ${m.saved} column marks shown in Step 2 (saved).\n`}
   const r=await post("/api/run",{path:p,mode:$("mode").value,model:$("model").value,limit:+$("limit").value,presidio:$("presidio").checked,date:$("rdate").value});
   if(r.error){$("log").textContent=r.error;$("run").disabled=false;$("bar").classList.remove("on");return}
   timer=setInterval(poll,700);
