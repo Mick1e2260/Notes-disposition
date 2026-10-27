@@ -6,6 +6,7 @@ Flow: 1 pick workbook  ->  2 mark which column headers hold PHI (saved per repor
 Steps run as child processes of this program (see gui.self_cmd), so masking must succeed before any LLM step starts.
 Only headers are ever read for the page; the log shows counts, never cell data.
 """
+import contextlib
 import io
 import json
 import os
@@ -16,7 +17,8 @@ import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from datetime import datetime
+from urllib.parse import parse_qs, quote, urlparse
 
 import pandas as pd
 
@@ -24,6 +26,7 @@ import daily_mask as dm
 import gui
 import mask_columns as mc
 import phi_scrub as ps
+import reidentify
 
 TOKEN = secrets.token_urlsafe(16)
 JOB = {"lines": [], "done": True, "ok": True, "running": False}
@@ -36,8 +39,28 @@ def say(s):
         JOB["lines"].append(s.rstrip("\n"))
 
 
+UPLOADS = {}  # id -> (filename, bytes). Added workbooks live in memory only and are never written to disk.
+MAX_UPLOAD = 100 * 1024 * 1024
+
+
+def raw_of(path):
+    return UPLOADS[path[4:]][1] if str(path).startswith("mem:") else Path(path).read_bytes()
+
+
+def name_of(path):
+    return UPLOADS[path[4:]][0] if str(path).startswith("mem:") else Path(path).name
+
+
+def sheet_kind(path):
+    xl = pd.ExcelFile(io.BytesIO(raw_of(path)))
+    for n in xl.sheet_names:
+        k = dm.detect_profile(pd.read_excel(xl, n, nrows=0).columns)
+        if k:
+            return k
+
+
 def sheets_of(path):
-    return pd.ExcelFile(io.BytesIO(Path(path).read_bytes())).sheet_names
+    return pd.ExcelFile(io.BytesIO(raw_of(path))).sheet_names
 
 
 _DF = {}  # (path, mtime, sheet) -> DataFrame, memory only (never written to disk)
@@ -52,11 +75,11 @@ PATTERNS = {
 
 
 def frame(path, sheet):
-    p = Path(path)
-    key = (str(p), p.stat().st_mtime, sheet)
+    mem = str(path).startswith("mem:")
+    key = (str(path), 0 if mem else Path(path).stat().st_mtime, sheet)
     if key not in _DF:
         _DF.clear()
-        _DF[key] = pd.read_excel(io.BytesIO(p.read_bytes()), sheet)
+        _DF[key] = pd.read_excel(io.BytesIO(raw_of(path)), sheet)
     return _DF[key]
 
 
@@ -88,7 +111,7 @@ def columns_of(path, sheet):
 def preview(path, sheet, col, role):
     """What the first 3 filled cells become under `role` (masked output only; Not PHI shows the value as-is)."""
     df = frame(path, sheet)
-    anchor = dm.anchor_date(Path(path), None)
+    anchor = dm.anchor_date(Path(name_of(path)), None)
     ps.SALT = dm.private_setup()
     k0 = len(ps.key_rows)
     out = []
@@ -114,20 +137,44 @@ def preview(path, sheet, col, role):
 def resolve_mode(path, mode):
     if mode != "auto":
         return mode
-    kind = gui.sheet_kind(Path(path))
+    kind = sheet_kind(path)
     say(f"Detected sheet type: {kind or 'unknown'}")
     return {"audit": "review", "inventory": "classify"}.get(kind, "mask")
 
 
+class _Say:
+    def write(self, s):
+        for line in s.splitlines():
+            if line.strip():
+                say(line)
+
+    def flush(self):
+        pass
+
+
+def mask_uploaded(opts):
+    """Mask an in-memory workbook inside this process (no file ever holds the original)."""
+    path = opts["path"]
+    try:
+        with contextlib.redirect_stdout(_Say()):
+            dm.process(raw_of(path), name_of(path), dm.anchor_date(Path(name_of(path)), opts.get("date") or None),
+                       opts.get("presidio", True))
+        return True
+    except Exception as e:
+        say(f"Masking failed: {type(e).__name__}: {e}. Nothing was sent to the LLM.")
+        return False
+
+
 def run_job(opts):
-    p = Path(opts["path"])
+    p = opts["path"]
+    mem = str(p).startswith("mem:")
     try:
         mode = resolve_mode(p, opts.get("mode", "auto"))
     except Exception as e:
         say(f"Could not read the workbook: {e}")
         JOB.update(done=True, ok=False, running=False)
         return
-    steps = [gui.self_cmd("mask", str(p), *([] if opts.get("presidio", True) else ["--no-presidio"]))]
+    steps = [None if mem else gui.self_cmd("mask", str(p), *([] if opts.get("presidio", True) else ["--no-presidio"]))]
     if mode != "mask":
         extra = ["--model", opts.get("model") or gui.DEFAULT_MODEL]
         if int(opts.get("limit") or 0) > 0:
@@ -137,8 +184,13 @@ def run_job(opts):
         steps.append(gui.self_cmd(mode, *extra))
     ok = True
     for i, cmd in enumerate(steps, 1):
-        name = next(c for c in cmd if c in ("mask", "review", "classify"))
+        name = "mask" if cmd is None else next(c for c in cmd if c in ("mask", "review", "classify"))
         say(f"--- step {i}/{len(steps)}: {name} ---")
+        if cmd is None:
+            if not mask_uploaded(opts):
+                ok = False
+                break
+            continue
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, creationflags=0x08000000)
         for line in proc.stdout:
             say(line)
@@ -147,6 +199,17 @@ def run_job(opts):
             ok = False
             break
     JOB.update(done=True, ok=ok, running=False)
+
+
+def outputs():
+    """Masked results that may be downloaded. QUARANTINE files stay local (they hold rows that still look risky)."""
+    if not dm.MASKED_DIR.exists():
+        return []
+    fs = [f for f in dm.MASKED_DIR.glob("*.xlsx") if not f.name.startswith("~$") and not f.stem.endswith("QUARANTINE")]
+    fs.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+    return [{"name": f.name, "kind": "masked" if f.stem.endswith("MASKED") else "result",
+             "when": datetime.fromtimestamp(f.stat().st_mtime).strftime("%d %b %H:%M"), "kb": round(f.stat().st_size / 1024)}
+            for f in fs]
 
 
 class H(BaseHTTPRequestHandler):
@@ -165,6 +228,19 @@ class H(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(b)
+
+    def _file(self, name, data, extra=None):
+        ascii_name = name.encode("ascii", "replace").decode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        self.send_header("Content-Disposition", 'attachment; filename="' + ascii_name + '"; filename*=UTF-8\'\'' + quote(name))
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        for k, v in (extra or {}).items():
+            self.send_header(k, str(v))
+        self.send_header("Access-Control-Expose-Headers", "Content-Disposition, X-Restored, X-Unresolved, X-Dates")
+        self.end_headers()
+        self.wfile.write(data)
 
     def do_GET(self):
         u = urlparse(self.path)
@@ -186,6 +262,12 @@ class H(BaseHTTPRequestHandler):
                 return self._send(200, {"sheets": sheets_of(q["path"])})
             if u.path == "/api/columns":
                 return self._send(200, columns_of(q["path"], q["sheet"]))
+            if u.path == "/api/outputs":
+                return self._send(200, {"files": outputs()})
+            if u.path == "/api/download":
+                if q["file"] not in {o["name"] for o in outputs()}:
+                    return self._send(404, {"error": "not an available result"})
+                return self._file(q["file"], (dm.MASKED_DIR / q["file"]).read_bytes())
             if u.path == "/api/preview":
                 return self._send(200, {"preview": preview(q["path"], q["sheet"], q["col"], q["role"])})
             if u.path == "/api/job":
@@ -200,15 +282,36 @@ class H(BaseHTTPRequestHandler):
         if not self._ok() or self.headers.get("X-Token") != TOKEN:
             return self._send(403, {"error": "forbidden"})
         n = int(self.headers.get("Content-Length") or 0)
-        body = json.loads(self.rfile.read(n) or b"{}")
-        u = urlparse(self.path).path
+        if n > MAX_UPLOAD:
+            return self._send(413, {"error": "file too large"})
+        raw = self.rfile.read(n)
+        u, qs = urlparse(self.path).path, {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
         try:
+            if u == "/api/upload":
+                name = Path(qs.get("name", "upload.xlsx")).name
+                pd.ExcelFile(io.BytesIO(raw))  # must be a readable workbook
+                uid = secrets.token_hex(6)
+                UPLOADS.clear()  # one added workbook at a time keeps memory bounded
+                UPLOADS[uid] = (name, raw)
+                return self._send(200, {"path": "mem:" + uid, "name": name})
+            if u == "/api/restore":
+                known = {o["name"] for o in outputs()}
+                src = raw if raw else ((dm.MASKED_DIR / qs["out"]).read_bytes() if qs.get("out") in known else None)
+                if src is None:
+                    return self._send(400, {"error": "choose a masked workbook"})
+                fname = qs.get("name") or qs.get("out") or "masked.xlsx"
+                anchor = dm.anchor_date(Path(fname), qs.get("date") or None)
+                data, st = reidentify.restore_bytes(src, anchor)
+                stem = re.sub(r"\s*-\s*(MASKED|CLASSIFIED|LLM REVIEW)$", "", Path(fname).stem)
+                return self._file(stem + " - RESTORED.xlsx", data,
+                                  {"X-Restored": st["restored"], "X-Unresolved": st["unresolved"], "X-Dates": st["dates"]})
+            body = json.loads(raw or b"{}")
             if u == "/api/browse":
                 r = subprocess.run(gui.self_cmd("pick"), capture_output=True, text=True, creationflags=0x08000000)
                 return self._send(200, {"path": r.stdout.strip()})
             if u == "/api/profile":
                 roles = body["roles"]
-                name = mc.re.sub(r"\W+", "_", f"{Path(body['path']).stem}_{body['sheet']}")[:40]
+                name = mc.re.sub(r"\W+", "_", f"{Path(name_of(body['path'])).stem}_{body['sheet']}")[:40]
                 mc.save_profile(mc.profile_from_roles(name, roles))
                 return self._send(200, {"saved": sum(r != "Not PHI" for r in roles.values()), "of": len(roles)})
             if u == "/api/run":
@@ -319,6 +422,12 @@ input[type=number]{width:92px}
 .shapes div{display:flex;gap:14px;align-items:baseline;font-size:13px;color:var(--muted)}
 code{font:12.5px var(--mono)}.pv{display:grid;gap:5px;margin-top:6px}
 .pv code{background:var(--log-bg);color:var(--log-ink);padding:6px 10px;border-radius:6px;white-space:pre-wrap;word-break:break-word}
+.drop{margin-top:12px;padding:16px;border:1.5px dashed var(--line);border-radius:10px;color:var(--muted);font-size:13.5px;cursor:pointer;transition:border-color .2s var(--ease),background .2s var(--ease)}
+.drop:hover,.drop.over,.drop:focus-visible{border-color:var(--accent);background:var(--accent-soft);outline:none}.drop u{color:var(--accent)}
+.rh{font:600 12px var(--display);letter-spacing:.07em;text-transform:uppercase;color:var(--muted);margin:24px 0 6px}
+.frow{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:9px 0;border-bottom:1px solid var(--line)}
+.fn{display:grid;min-width:0}.fn b{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}.fn small{color:var(--muted);font-size:12.5px}
+input[type=date]{min-height:40px}
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style></head><body><main>
 <header>
@@ -330,6 +439,7 @@ code{font:12.5px var(--mono)}.pv{display:grid;gap:5px;margin-top:6px}
   <h2>Workbook</h2><p class="hint">Defaults to the newest audit result in OneDrive. Only column headers are read here.</p>
   <div class="row"><input type="text" id="path" placeholder="Path to an .xlsx file" spellcheck="false"><button id="browse">Browse…</button></div>
   <div class="row" style="margin-top:10px"><select id="sheet" aria-label="Sheet"></select><span class="chip" id="kind" style="display:none"></span></div>
+  <div class="drop" id="drop" tabindex="0" role="button" aria-label="Add a workbook">Drop an .xlsx here, or <u>add a workbook</u>. It is held in memory only and never saved.<input type="file" id="file" accept=".xlsx,.xlsm" hidden></div>
   <div class="err" id="err1"></div>
 </div></section>
 
@@ -354,12 +464,25 @@ code{font:12.5px var(--mono)}.pv{display:grid;gap:5px;margin-top:6px}
   <div class="row" style="margin-top:16px"><button class="primary" id="run">Run</button><button id="open">Open output folder</button><span class="state" id="state"></span></div>
   <div class="bar" id="bar"><b></b></div>
   <pre id="log"></pre>
+  <h3 class="rh">Results</h3><div id="results" class="files"></div>
+</div></section>
+
+<section><div class="step">Step 4</div><div>
+  <h2>Restore originals</h2>
+  <p class="hint">Turns a masked workbook back into the real values using the private key on this PC. The restored file contains PHI: it is built in memory and downloaded straight to you, never saved here.</p>
+  <div class="row"><select id="rsel" aria-label="Masked workbook"></select><span class="muted">or</span>
+    <button id="raddbtn">Add a masked workbook…</button><input type="file" id="rfile" accept=".xlsx,.xlsm" hidden><span id="rname" class="muted"></span></div>
+  <div class="row" style="margin-top:10px"><label class="chk">Work date <input type="date" id="rdate"></label>
+    <span class="muted">Only needed if the file name has no date. Turns day offsets back into dates.</span></div>
+  <div class="row" style="margin-top:16px"><button class="primary" id="restore">Restore and download</button><span class="state" id="rstate"></span></div>
+  <p class="muted" id="rnote" style="margin-top:10px"></p>
 </div></section>
 </main>
 <script>
 const T="__TOKEN__",$=id=>document.getElementById(id);
 const api=(p,o={})=>fetch(p,{...o,headers:{"X-Token":T,"Content-Type":"application/json"}}).then(r=>r.json());
 const post=(p,b)=>api(p,{method:"POST",body:JSON.stringify(b||{})});
+let CUR="",rfile=null;const P=()=>CUR;function setPath(p,d){CUR=p;$("path").value=d||p;loadSheets()}
 let roles={},ROLES=[],timer=null,since=0,STATS={},OPEN=new Set(),PREV={};
 const esc=x=>String(x).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const HITLBL={phone:"phone numbers",email:"emails",ssn:"SSN-like",date:"dates",id:"long IDs",name:"name-like"};
@@ -379,7 +502,7 @@ function detail(c){
 }
 async function loadPrev(c){
   const role=roles[c],k=c+"|"+role;if(PREV[k])return;
-  const r=await api("/api/preview?"+new URLSearchParams({path:$("path").value.trim(),sheet:$("sheet").value,col:c,role}));
+  const r=await api("/api/preview?"+new URLSearchParams({path:P(),sheet:$("sheet").value,col:c,role}));
   PREV[k]=r.error?[r.error]:r.preview;renderCols();
 }
 function renderCols(){
@@ -403,7 +526,7 @@ function renderCols(){
 }
 async function loadCols(){
   $("err1").textContent="";
-  const q=new URLSearchParams({path:$("path").value.trim(),sheet:$("sheet").value});
+  const q=new URLSearchParams({path:P(),sheet:$("sheet").value});
   const r=await api("/api/columns?"+q);
   if(r.error){$("err1").textContent=r.error;return}
   roles=r.roles;STATS=r.stats;PREV={};OPEN=new Set();
@@ -411,35 +534,79 @@ async function loadCols(){
   renderCols();
 }
 async function loadSheets(){
-  const p=$("path").value.trim();if(!p)return;$("err1").textContent="";
+  const p=P();if(!p)return;$("err1").textContent="";
   const r=await api("/api/sheets?"+new URLSearchParams({path:p}));
   if(r.error){$("err1").textContent="Cannot read that file: "+r.error;return}
   $("sheet").innerHTML=r.sheets.map(s=>`<option>${s.replace(/</g,"&lt;")}</option>`).join("");loadCols();
 }
-$("browse").onclick=async()=>{const r=await post("/api/browse");if(r.path){$("path").value=r.path;loadSheets()}};
-$("path").onchange=loadSheets;$("sheet").onchange=loadCols;$("filter").oninput=renderCols;$("flagged").onchange=renderCols;
-$("save").onclick=async()=>{const r=await post("/api/profile",{path:$("path").value.trim(),sheet:$("sheet").value,roles});
+$("browse").onclick=async()=>{const r=await post("/api/browse");if(r.path)setPath(r.path)};
+$("path").onchange=()=>{CUR=$("path").value.trim();loadSheets()};$("sheet").onchange=loadCols;$("filter").oninput=renderCols;$("flagged").onchange=renderCols;
+$("save").onclick=async()=>{const r=await post("/api/profile",{path:P(),sheet:$("sheet").value,roles});
   $("saved").className="state ok";$("saved").textContent=r.error?r.error:`Saved ${r.saved}/${r.of}`};
 $("open").onclick=()=>post("/api/open");
 $("quit").onclick=async()=>{await post("/api/quit");document.body.innerHTML='<main><h1>Stopped</h1><p class="sub">You can close this tab.</p></main>'};
 $("run").onclick=async()=>{
-  const p=$("path").value.trim();if(!p){$("err1").textContent="Pick a workbook first.";return}
+  const p=P();if(!p){$("err1").textContent="Pick a workbook first.";return}
   $("log").textContent="";since=0;$("state").textContent="";$("run").disabled=true;$("bar").classList.add("on");
-  const r=await post("/api/run",{path:p,mode:$("mode").value,model:$("model").value,limit:+$("limit").value,presidio:$("presidio").checked});
+  const r=await post("/api/run",{path:p,mode:$("mode").value,model:$("model").value,limit:+$("limit").value,presidio:$("presidio").checked,date:$("rdate").value});
   if(r.error){$("log").textContent=r.error;$("run").disabled=false;$("bar").classList.remove("on");return}
   timer=setInterval(poll,700);
 };
 async function poll(){
   const r=await api("/api/job?since="+since);since=r.n;
   if(r.lines.length){const l=$("log");l.textContent+=r.lines.join("\n")+"\n";l.scrollTop=l.scrollHeight}
-  if(r.done){clearInterval(timer);$("run").disabled=false;$("bar").classList.remove("on");
+  if(r.done){clearInterval(timer);loadOutputs();$("run").disabled=false;$("bar").classList.remove("on");
     $("state").className="state "+(r.ok?"ok":"fail");$("state").textContent=r.ok?"Done":"Failed"}
 }
+
+async function fetchFile(url,opts){
+  const r=await fetch(url,{...opts,headers:{"X-Token":T,...((opts||{}).headers||{})}});
+  if(!r.ok){let m="Failed";try{m=(await r.json()).error||m}catch(e){}throw new Error(m)}
+  const blob=await r.blob(),cd=r.headers.get("Content-Disposition")||"";
+  const m=/filename\*=UTF-8''([^;]+)/.exec(cd)||/filename="([^"]+)"/.exec(cd);
+  const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=m?decodeURIComponent(m[1]):"download.xlsx";
+  document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(a.href),4000);return r;
+}
+const download=n=>fetchFile("/api/download?"+new URLSearchParams({file:n})).catch(e=>alert(e.message));
+async function loadOutputs(){
+  const f=(await api("/api/outputs")).files||[];
+  $("results").innerHTML=f.length?f.map(o=>`<div class="frow"><span class="fn"><b>${esc(o.name)}</b><small>${o.kind==="masked"?"Masked workbook":"Review output"} · ${esc(o.when)} · ${o.kb} KB</small></span><button data-n="${esc(o.name)}" class="dl ${o.kind==="masked"?"primary":""}">Download</button></div>`).join(""):'<p class="muted">Nothing yet. Run a mask to create a masked workbook.</p>';
+  document.querySelectorAll(".dl").forEach(b=>b.onclick=()=>download(b.dataset.n));
+  const keep=$("rsel").value;$("rsel").innerHTML=f.map(o=>`<option value="${esc(o.name)}">${esc(o.name)}</option>`).join("");if(keep)$("rsel").value=keep;
+}
+async function upload(file){
+  if(!file)return;$("err1").textContent="Reading "+file.name+"…";
+  const r=await fetch("/api/upload?"+new URLSearchParams({name:file.name}),{method:"POST",headers:{"X-Token":T,"Content-Type":"application/octet-stream"},body:file}).then(x=>x.json());
+  if(r.error){$("err1").textContent="Cannot read that file: "+r.error;return}
+  $("err1").textContent="";setPath(r.path,r.name+"  (added, memory only)");
+}
+const dz=$("drop");
+dz.onclick=()=>$("file").click();dz.onkeydown=e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();$("file").click()}};
+$("file").onchange=e=>{upload(e.target.files[0]);e.target.value=""};
+["dragenter","dragover"].forEach(t=>dz.addEventListener(t,e=>{e.preventDefault();dz.classList.add("over")}));
+["dragleave","drop"].forEach(t=>dz.addEventListener(t,e=>{e.preventDefault();dz.classList.remove("over")}));
+dz.addEventListener("drop",e=>upload(e.dataTransfer.files[0]));
+$("raddbtn").onclick=()=>$("rfile").click();
+$("rfile").onchange=e=>{rfile=e.target.files[0]||null;$("rname").textContent=rfile?rfile.name:"";e.target.value=""};
+$("restore").onclick=async()=>{
+  $("rstate").textContent="";$("rnote").textContent="";
+  if(!rfile&&!$("rsel").value){$("rstate").className="state fail";$("rstate").textContent="Choose a masked workbook";return}
+  if(!confirm("The restored workbook contains PHI. It is created in memory and downloaded to this browser only. Continue?"))return;
+  const q=new URLSearchParams(rfile?{name:rfile.name}:{out:$("rsel").value,name:$("rsel").value});if($("rdate").value)q.set("date",$("rdate").value);
+  $("restore").disabled=true;
+  try{
+    const r=await fetchFile("/api/restore?"+q,{method:"POST",headers:{"Content-Type":"application/octet-stream"},body:rfile||undefined});
+    const un=+r.headers.get("X-Unresolved");
+    $("rstate").className="state ok";$("rstate").textContent="Downloaded";
+    $("rnote").textContent=`${r.headers.get("X-Restored")} values restored, ${r.headers.get("X-Dates")} dates rebuilt`+(un?`; ${un} tokens had no key and were left as they are.`:".");
+  }catch(e){$("rstate").className="state fail";$("rstate").textContent=e.message}
+  $("restore").disabled=false;
+};
 (async()=>{
   const s=await api("/api/state");ROLES=s.roles;
   $("oll").className="chip "+(s.ollama?"on":"off");$("oll").lastChild.textContent=s.ollama?"Ollama ready":"Ollama offline";
   $("model").innerHTML=(s.models.length?s.models:[s.model]).map(m=>`<option ${m===s.model?"selected":""}>${m}</option>`).join("");
-  if(s.path){$("path").value=s.path;loadSheets()}
+  if(s.path)setPath(s.path);loadOutputs();
 })();
 </script></body></html>'''
 

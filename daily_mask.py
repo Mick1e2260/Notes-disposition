@@ -195,39 +195,43 @@ def warn_unmarked(df, cols):
                       "Mark it in mask_columns.py if it holds PHI.")
 
 
+def process(raw, filename, anchor, use_presidio=True):
+    """Mask every matching sheet of a workbook given as bytes. Returns the masked file's path.
+    `raw` is never written anywhere; only masked output, the quarantine file and the private key are."""
+    ps.SALT = private_setup()
+    MASKED_DIR.mkdir(parents=True, exist_ok=True)
+    sheets = load_sheets(raw)
+    stem = re.sub(r"\s*\(\d+\)$", "", Path(filename).stem)
+    safe_path = MASKED_DIR / f"{stem} - MASKED.xlsx"
+    ps.key_rows.clear()
+    with pd.ExcelWriter(safe_path) as ws, pd.ExcelWriter(MASKED_DIR / f"{stem} - QUARANTINE.xlsx") as wq:
+        for name, prof, df in sheets:
+            out = mask(df, prof, anchor, use_presidio)
+            safe = out[out["Residual Risk"] == ""].drop(columns="Residual Risk")
+            quar = out[out["Residual Risk"] != ""]
+            safe.to_excel(ws, sheet_name=name[:31], index=False)
+            quar.to_excel(wq, sheet_name=name[:31], index=False)
+            line = (f"{datetime.now():%Y-%m-%d %H:%M} | {filename} | '{name}' ({prof}) | rows {len(df)} | "
+                    f"safe {len(safe)} | quarantined {len(quar)} | presidio {use_presidio}")
+            with open(PRIVATE_DIR / "run_log.txt", "a") as f:
+                f.write(line + chr(10))
+            print(line)
+            if len(quar):
+                print(quar["Residual Risk"].str.split(", ").explode().value_counts().to_string())
+    key = pd.DataFrame(ps.key_rows, columns=["Token", "Type", "Original"]).drop_duplicates("Token")
+    key.to_excel(PRIVATE_DIR / f"{stem} - REID KEY {datetime.now():%Y%m%d-%H%M%S}.xlsx", index=False)
+    print(f"masked -> {safe_path} | tokens {len(key)}")
+    return safe_path
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("workbook", nargs="*")
     ap.add_argument("--date")
     ap.add_argument("--no-presidio", action="store_true")
     a = ap.parse_args()
-
-    ps.SALT = private_setup()
-    MASKED_DIR.mkdir(parents=True, exist_ok=True)
     for src in pick_sources(a.workbook):
-        raw = src.read_bytes()  # memory only
-        sheets = load_sheets(raw)
-        del raw
-        stem = re.sub(r"\s*\(\d+\)$", "", src.stem)
-        safe_path = MASKED_DIR / f"{stem} - MASKED.xlsx"
-        ps.key_rows.clear()
-        with pd.ExcelWriter(safe_path) as ws, pd.ExcelWriter(MASKED_DIR / f"{stem} - QUARANTINE.xlsx") as wq:
-            for name, prof, df in sheets:
-                out = mask(df, prof, anchor_date(src, a.date), not a.no_presidio)
-                safe = out[out["Residual Risk"] == ""].drop(columns="Residual Risk")
-                quar = out[out["Residual Risk"] != ""]
-                safe.to_excel(ws, sheet_name=name[:31], index=False)
-                quar.to_excel(wq, sheet_name=name[:31], index=False)
-                line = (f"{datetime.now():%Y-%m-%d %H:%M} | {src.name} | '{name}' ({prof}) | rows {len(df)} | "
-                        f"safe {len(safe)} | quarantined {len(quar)} | presidio {not a.no_presidio}")
-                with open(PRIVATE_DIR / "run_log.txt", "a") as f:
-                    f.write(line + "\n")
-                print(line)
-                if len(quar):
-                    print(quar["Residual Risk"].str.split(", ").explode().value_counts().to_string())
-        key = pd.DataFrame(ps.key_rows, columns=["Token", "Type", "Original"]).drop_duplicates("Token")
-        key.to_excel(PRIVATE_DIR / f"{stem} - REID KEY {datetime.now():%Y%m%d-%H%M%S}.xlsx", index=False)
-        print(f"masked -> {safe_path} | tokens {len(key)}")
+        process(src.read_bytes(), src.name, anchor_date(src, a.date), not a.no_presidio)  # source stays in memory
 
 
 if __name__ == "__main__":

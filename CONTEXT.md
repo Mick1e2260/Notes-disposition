@@ -211,3 +211,12 @@ LLM must be checked against the QA answer key (roadmap step 1) before it is trus
 | `phi_scrub.py` | De-identification, quarantine and re-identification key |
 | `CONTEXT.md` | This document |
 | `.gitignore` | Blocks all data and outputs from git |
+
+### Add / download / restore (browser UI)
+- **Add a workbook:** drop an .xlsx on Step 1 (or use "add a workbook"). It is held in server memory only (`webui.UPLOADS`, one at a
+  time, 100 MB cap) and masked in-process by `daily_mask.process()`; the original is never written to disk.
+- **Download:** Step 3 lists the masked workbook and review outputs with Download buttons. QUARANTINE files are never offered.
+- **Restore originals (`reidentify.py`):** turns a masked workbook (from the results list, or any masked workbook added) back into real
+  values using every `REID KEY` in the private dir; the restored file is built in memory and streamed to the browser, never saved.
+  Date columns and `[D-n]` tokens are rebuilt from the work date (file-name date or the date field) as MM/DD/YYYY. Not recoverable:
+  dropped columns, `[DATE]` (far-off dates such as DOB), quarantined rows; name case variants return in first-seen form.
