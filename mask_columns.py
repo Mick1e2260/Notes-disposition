@@ -126,8 +126,9 @@ class App(tk.Tk):
         save_profile(profile_from_roles(name, roles))
         marked = sum(r != "Not PHI" for r in roles.values())
         if run:
-            r = subprocess.run([sys.executable, str(Path(__file__).with_name("daily_mask.py")), str(self.path)],
-                               capture_output=True, text=True, cwd=Path(__file__).parent)
+            cmd = ([sys.executable, "mask"] if getattr(sys, "frozen", False)
+                   else [sys.executable, str(Path(__file__).with_name("ar_audit.py")), "mask"]) + [str(self.path)]
+            r = subprocess.run(cmd, capture_output=True, text=True)
             messagebox.showinfo("Masked", (r.stdout or r.stderr)[-1500:])
         else:
             messagebox.showinfo("Saved", f"{marked} of {len(roles)} columns marked. daily_mask.py will use this "
