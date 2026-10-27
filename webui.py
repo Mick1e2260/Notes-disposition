@@ -28,6 +28,7 @@ import daily_mask as dm
 import gui
 import headermem as hm
 import mask_columns as mc
+import mask_columns_logic as ml
 import phi_scrub as ps
 import reidentify
 
@@ -59,16 +60,24 @@ def name_of(path):
 def sheet_kind(path):
     xl = pd.ExcelFile(io.BytesIO(raw_of(path)))
     for n in xl.sheet_names:
-        k = dm.builtin_profile(pd.read_excel(xl, n, nrows=0).columns)
+        k = dm.builtin_profile(dm.read_sheet(xl, n, nrows=0).columns)
         if k:
             return k
 
 
 def sheets_of(path):
-    return pd.ExcelFile(io.BytesIO(raw_of(path))).sheet_names
+    """Every sheet with its column count and whether its headers already have saved tags."""
+    xl = pd.ExcelFile(io.BytesIO(raw_of(path)))
+    out = []
+    for n in xl.sheet_names:
+        cols = list(dm.read_sheet(xl, n, nrows=0).columns)
+        prof = dm.detect_profile(cols)
+        out.append({"name": n, "cols": len(cols), "status": "tagged" if prof and prof not in dm.PROFILES else "suggested"})
+    return out
 
 
 _DF = {}  # (path, mtime, sheet) -> DataFrame, memory only (never written to disk)
+SAMPLE = 400  # headers appear at once; stats and previews use the first rows (the full sheet is only read by Run)
 PATTERNS = {
     "phone": re.compile(r"\(?\b\d{3}\)?[\s.-]\d{3}[\s.-]\d{4}\b"),
     "email": re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+"),
@@ -84,7 +93,7 @@ def frame(path, sheet):
     key = (str(path), 0 if mem else Path(path).stat().st_mtime, sheet)
     if key not in _DF:
         _DF.clear()
-        _DF[key] = pd.read_excel(io.BytesIO(raw_of(path)), sheet)
+        _DF[key] = dm.read_sheet(pd.ExcelFile(io.BytesIO(raw_of(path))), sheet, nrows=SAMPLE)
     return _DF[key]
 
 
@@ -99,7 +108,11 @@ def col_stats(s):
     out = {"rows": int(len(s)), "filled": round(len(nn) / max(len(s), 1) * 100), "distinct": int(nn.nunique()),
            "type": "date" if pd.api.types.is_datetime64_any_dtype(s) else "number" if pd.api.types.is_numeric_dtype(s) else "text",
            "avg_len": int(txt.str.len().mean()) if len(txt) else 0}
-    out["hits"] = {k: int(txt.str.contains(rx).sum()) for k, rx in PATTERNS.items()} if out["type"] == "text" else {}
+    out["hits"] = {}
+    if out["type"] == "text":
+        out["hits"] = {k: int(txt.str.contains(rx).sum()) for k, rx in PATTERNS.items() if k != "name"}
+        # "Follow-Up Required" looks like a name to the pattern; only count cells with a name that is not RCM vocabulary
+        out["hits"]["name"] = int(txt.map(lambda v: any(not ps.is_vocab(m.group(0)) for m in PATTERNS["name"].finditer(v))).sum())
     out["hits"] = {k: v for k, v in out["hits"].items() if v}
     out["shapes"] = [[k, int(v)] for k, v in txt.map(shape).value_counts().head(3).items()] if out["type"] != "number" else []
     return out
@@ -108,14 +121,16 @@ def col_stats(s):
 def columns_of(path, sheet):
     df = frame(path, sheet)
     cols = [str(c) for c in df.columns]
-    roles, src = hm.role_map(cols, mc.guess_role, mc.guess_kind)
-    return {"columns": cols, "roles": roles, "src": src, "profile": dm.detect_profile(cols),
-            "stats": {str(c): col_stats(df[c]) for c in df.columns},
-            "guess": {c: mc.guess_role(c) for c in cols}}
+    roles, src = hm.role_map(cols, lambda c: ml.guess_role_data(c, df[c]), mc.guess_kind)
+    prof = dm.detect_profile(cols)
+    ps.VOCAB = dm.sheet_vocab(df, {k: [c for c, r in roles.items() if r == role] for k, role in
+                                   (("tokens", "Identifier"), ("dates", "Date"), ("text", "Text"), ("phi", "PHI"), ("drop", "Drop"))})
+    return {"columns": cols, "roles": roles, "src": src, "profile": None if prof in dm.PROFILES else prof,
+            "stats": {str(c): col_stats(df[c]) for c in df.columns}}
 
 
 def preview(path, sheet, col, role):
-    """What the first 3 filled cells become under `role` (masked output only; Not PHI shows the value as-is)."""
+    """What the first 3 filled cells become under `role` (masked output only; No PHI shows the value as-is)."""
     df = frame(path, sheet)
     anchor = dm.anchor_date(Path(name_of(path)), None)
     ps.SALT = dm.private_setup()
@@ -123,12 +138,14 @@ def preview(path, sheet, col, role):
     out = []
     try:
         for v in df[col].dropna().head(3):
-            if role == "Identifier":
-                out.append(ps.token(mc.guess_kind(col), v))
+            if role == "PHI":
+                out.append(ps.star(v))
+            elif role == "Identifier":
+                out.append(ps.token(hm.kind_for(col, mc.guess_kind), v, "token"))
             elif role == "Date":
                 d = pd.to_datetime(v, errors="coerce")
                 out.append("unreadable date" if pd.isna(d) else f"{(d - pd.Timestamp(anchor)).days:+d} days from work date")
-            elif role == "Free text":
+            elif role == "Text":
                 import presidio_layer as pl
                 out.append(pl.presidio_scrub(ps.scrub_note(str(v), anchor)))
             elif role == "Drop":
@@ -164,7 +181,7 @@ def mask_uploaded(opts):
     try:
         with contextlib.redirect_stdout(_Say()):
             dm.process(raw_of(path), name_of(path), dm.anchor_date(Path(name_of(path)), opts.get("date") or None),
-                       opts.get("presidio", True))
+                       opts.get("presidio", True), suggest_all=True)
         return True
     except BaseException as e:  # includes SystemExit raised for 'no matching sheet'
         say(f"Masking failed: {e if isinstance(e, SystemExit) else type(e).__name__ + ': ' + str(e)}. Nothing was sent to the LLM.")
@@ -190,7 +207,7 @@ def _run_job(opts):
         say(f"Could not read the workbook: {e}")
         JOB.update(done=True, ok=False, running=False)
         return
-    steps = [None if mem else gui.self_cmd("mask", str(p), *([] if opts.get("presidio", True) else ["--no-presidio"]))]
+    steps = [None if mem else gui.self_cmd("mask", str(p), "--suggest", *([] if opts.get("presidio", True) else ["--no-presidio"]))]
     if mode != "mask":
         extra = ["--model", opts.get("model") or gui.DEFAULT_MODEL]
         if int(opts.get("limit") or 0) > 0:
@@ -268,7 +285,7 @@ class H(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         for k, v in (extra or {}).items():
             self.send_header(k, str(v))
-        self.send_header("Access-Control-Expose-Headers", "Content-Disposition, X-Restored, X-Unresolved, X-Dates")
+        self.send_header("Access-Control-Expose-Headers", "Content-Disposition, X-Restored, X-Unresolved, X-Dates, X-Ambiguous")
         self.end_headers()
         self.wfile.write(data)
 
@@ -285,7 +302,7 @@ class H(BaseHTTPRequestHandler):
         q = {k: v[0] for k, v in parse_qs(u.query).items()}
         try:
             if u.path == "/api/state":
-                files = sorted(dm.SOURCE_DIR.glob(dm.PATTERN), key=lambda p: p.stat().st_mtime, reverse=True) if dm.SOURCE_DIR.exists() else []
+                files = dm.newest_sources()
                 models = gui.ollama_models()
                 return self._send(200, {"path": str(files[0]) if files else "", "models": models,
                                         "model": gui.DEFAULT_MODEL if (not models or gui.DEFAULT_MODEL in models) else models[0],
@@ -338,17 +355,18 @@ class H(BaseHTTPRequestHandler):
                 data, st = reidentify.restore_bytes(src, anchor)
                 stem = re.sub(r"\s*-\s*(MASKED|CLASSIFIED|LLM REVIEW)$", "", Path(fname).stem)
                 return self._file(stem + " - RESTORED.xlsx", data,
-                                  {"X-Restored": st["restored"], "X-Unresolved": st["unresolved"], "X-Dates": st["dates"]})
+                                  {"X-Restored": st["restored"], "X-Unresolved": st["unresolved"],
+                                   "X-Dates": st["dates"], "X-Ambiguous": st["ambiguous"]})
             body = json.loads(raw or b"{}")
             if u == "/api/browse":
                 r = subprocess.run(gui.self_cmd("pick"), capture_output=True, text=True, creationflags=0x08000000)
                 return self._send(200, {"path": r.stdout.strip()})
             if u == "/api/profile":
                 roles = body["roles"]
-                name = mc.re.sub(r"\W+", "_", f"{Path(name_of(body['path'])).stem}_{body['sheet']}")[:40]
+                name = mc.config_name(name_of(body["path"]), list(roles))  # one config per header set
                 mc.remember(roles)  # header memory: next sheet pre-fills these decisions
                 mc.save_profile(mc.profile_from_roles(name, roles))
-                return self._send(200, {"saved": sum(r != "Not PHI" for r in roles.values()), "of": len(roles)})
+                return self._send(200, {"saved": sum(r != "No PHI" for r in roles.values()), "of": len(roles), "config": name})
             if u == "/api/run":
                 with LOCK:
                     if JOB["running"]:
@@ -466,10 +484,10 @@ button.quiet{border-color:transparent;background:none;color:var(--muted)}
 .col{display:grid;grid-template-columns:1fr auto;gap:12px;align-items:center;padding:7px 2px;border-bottom:1px solid var(--line)}
 @media(max-width:700px){.col{grid-template-columns:1fr;gap:5px;padding:10px 2px}.seg{width:100%}.seg button{flex:1;padding:0 4px}.detail{padding-left:8px}.dgrid{grid-template-columns:repeat(2,1fr)}}
 .seg{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
-.seg button{border:0;border-radius:0;min-height:30px;padding:0 11px;font:500 12.5px var(--body);background:none;color:var(--muted);border-right:1px solid var(--line)}
+.seg button{border:0;border-radius:0;min-height:30px;padding:0 9px;white-space:nowrap;font:500 12.5px var(--body);background:none;color:var(--muted);border-right:1px solid var(--line)}
 .seg button:last-child{border-right:0}
 .seg button.sel{background:var(--accent);color:var(--accent-ink)}
-.seg button.sel.drop{background:var(--bad);color:#fff}
+.seg button.sel.isdrop{background:var(--bad);color:#fff}
 .meta{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-top:12px;color:var(--muted);font-size:13.5px;flex-wrap:wrap}
 label.chk{display:inline-flex;gap:8px;align-items:center;cursor:pointer}
 input[type=number]{width:92px}
@@ -517,13 +535,14 @@ input[type=date]{min-height:40px}
   <h2>Workbook</h2><p class="hint">Defaults to the newest audit result in OneDrive. Only column headers are read here.</p>
   <div class="row"><input type="text" id="path" placeholder="Path to an .xlsx file" spellcheck="false"><button id="browse">Browse…</button></div>
   <div class="row" style="margin-top:10px"><select id="sheet" aria-label="Sheet"></select><span class="chip" id="kind" style="display:none"></span></div>
+  <p class="muted" style="margin-top:8px">Every sheet goes into the masked file. A sheet you have not tagged uses the suggested tags; pick it here to check them. Title rows above the headers are found automatically.</p>
   <div class="drop" id="drop" tabindex="0" role="button" aria-label="Add a workbook">Drop an .xlsx here, or <u>add a workbook</u>. It is held in memory only and never saved.<input type="file" id="file" accept=".xlsx,.xlsm" hidden></div>
   <div class="err" id="err1"></div>
 </div></section>
 
 <section><div class="step">Step 2</div><div>
   <h2>Which columns contain PHI</h2>
-  <p class="hint">Mark by header, once per report type. Columns left as “Not PHI” are not touched, so mark anything with patient or staff details.</p>
+  <p class="hint">Tag each header once per file type; the next file with these headers is filled in for you. <b>PHI</b> keeps only the first and last character (S***H, J**N). <b>Text</b> keeps the sentence and masks only the names and numbers inside it.</p>
   <div class="row"><input type="text" id="filter" placeholder="Filter headers" style="max-width:260px;flex:none"><label class="chk"><input type="checkbox" id="flagged"> Only flagged</label></div>
   <div class="cols" id="cols"></div>
   <div class="meta"><span id="count">No columns loaded</span><span class="row"><span class="state" id="saved"></span><button id="save">Save marks</button></span></div>
@@ -533,7 +552,7 @@ input[type=date]{min-height:40px}
   <h2>Run</h2><p class="hint">Masking always runs first. If it fails, the review is skipped.</p>
   <div class="row">
     <select id="mode" aria-label="What to run">
-      <option value="auto">Auto (by sheet type)</option><option value="mask">Mask only</option>
+      <option value="mask">Masked Excel only</option><option value="auto">Masked Excel + LLM review (by sheet type)</option>
       <option value="review">Mask + audit review</option><option value="classify">Mask + classify (Open AR)</option></select>
     <select id="model" aria-label="Model"></select>
     <label class="chk">Max claims <input type="number" id="limit" min="0" value="0" title="0 = all"></label>
@@ -565,14 +584,14 @@ let roles={},ROLES=[],timer=null,since=0,STATS={},OPEN=new Set(),PREV={},SRC={};
 const known=()=>Object.keys(SRC).forEach(k=>SRC[k]="remembered");
 const esc=x=>String(x).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const HITLBL={phone:"phone numbers",email:"emails",ssn:"SSN-like",date:"dates",id:"long IDs",name:"name-like"};
-const ROLEHELP={"Not PHI":"Left exactly as it is.","Identifier":"Each value becomes a stable token.","Date":"Becomes days from the work date.","Free text":"Scanned with regex, Presidio and NER; anything found is replaced.","Drop":"Removed from the masked file."};
+const ROLEHELP={"No PHI":"Left exactly as it is.","PHI":"Whole value masked, first and last character kept: S***H, J**N.","Identifier":"Each value becomes a stable token you can group on and restore: [CLM-AB12CD].","Date":"Becomes days from the work date.","Text":"Sentence kept; only names, numbers, phones and emails inside it are masked.","Drop":"Removed from the masked file."};
 const sens=c=>Object.entries((STATS[c]||{}).hits||{}).filter(([k])=>k!=="date").reduce((a,[,v])=>a+v,0);
-const flagged=c=>roles[c]==="Not PHI"&&sens(c)>0;
+const flagged=c=>roles[c]==="No PHI"&&sens(c)>0;
 function detail(c){
   const s=STATS[c]||{},role=roles[c],pv=PREV[c+"|"+role];
-  const hits=Object.entries(s.hits||{}).map(([k,v])=>`<span class="tag ${role==="Not PHI"&&k!=="date"?"warn":""}">${v} ${HITLBL[k]}</span>`).join("")||'<span class="muted">No phone, email, SSN, ID or name patterns found.</span>';
+  const hits=Object.entries(s.hits||{}).map(([k,v])=>`<span class="tag ${role==="No PHI"&&k!=="date"?"warn":""}">${v} ${HITLBL[k]}</span>`).join("")||'<span class="muted">No phone, email, SSN, ID or name patterns found.</span>';
   const shapes=(s.shapes||[]).map(([k,v])=>`<div><code>${esc(k)}</code><span>${v} cells</span></div>`).join("");
-  const dnote=role==="Not PHI"&&s.type==="date"?'<p class="warn-t">Dates tied to a patient count as PHI under Safe Harbor. Consider “Date”.</p>':"";
+  const dnote=role==="No PHI"&&s.type==="date"?'<p class="warn-t">Dates tied to a patient count as PHI under Safe Harbor. Consider “Date”.</p>':"";
   return `<div class="dgrid"><div><b>${s.filled}%</b><small>filled</small></div><div><b>${s.distinct}</b><small>distinct</small></div><div><b>${s.type}</b><small>type</small></div><div><b>${s.avg_len}</b><small>avg length</small></div></div>
   <h4>Looks like</h4><div class="tags">${hits}</div>${dnote}
   ${shapes?`<h4>Common value shapes</h4><div class="shapes">${shapes}</div>`:""}
@@ -594,13 +613,13 @@ function renderCols(){
     n.onclick=()=>{open?OPEN.delete(c):OPEN.add(c);if(!open)loadPrev(c);renderCols()};
     const g=document.createElement("div");g.className="seg";g.setAttribute("role","group");g.setAttribute("aria-label","Role for "+c);
     ROLES.forEach(r=>{const b=document.createElement("button");b.textContent=r;
-      b.className=(roles[c]===r?"sel ":"")+(r==="Drop"?"drop":"");b.setAttribute("aria-pressed",roles[c]===r);
+      b.className=(roles[c]===r?"sel ":"")+(r==="Drop"?"isdrop":"");b.setAttribute("aria-pressed",roles[c]===r);
       b.onclick=()=>{roles[c]=r;$("saved").textContent="";if(OPEN.has(c))loadPrev(c);renderCols()};g.appendChild(b)});
     d.append(n,g);w.appendChild(d);
     if(open){const x=document.createElement("div");x.className="detail";x.innerHTML=detail(c);w.appendChild(x)}
     box.appendChild(w)});
   box.scrollTop=st;
-  const all=Object.keys(roles),m=all.filter(c=>roles[c]!=="Not PHI").length,fl=all.filter(flagged).length,nw=all.filter(c=>SRC[c]==="guessed").length;
+  const all=Object.keys(roles),m=all.filter(c=>roles[c]!=="No PHI").length,fl=all.filter(flagged).length,nw=all.filter(c=>SRC[c]==="guessed").length;
   $("count").textContent=all.length?`${m} of ${all.length} columns marked`+(nw?` · ${nw} new to review`:" · all remembered")+(fl?` · ${fl} unmarked look sensitive`:""):"No columns loaded";
 }
 async function loadCols(){
@@ -609,14 +628,15 @@ async function loadCols(){
   const r=await api("/api/columns?"+q);
   if(r.error){$("err1").textContent=r.error;return}
   roles=r.roles;SRC=r.src||{};STATS=r.stats;PREV={};OPEN=new Set();
-  const k=$("kind");k.style.display=r.profile?"inline-flex":"none";k.textContent=r.profile?("Detected: "+r.profile.replace("saved:","saved profile ")):"";
+  const k=$("kind");k.style.display=r.profile?"inline-flex":"none";k.textContent=r.profile?(r.profile.startsWith("saved:")?"Saved config: "+r.profile.slice(6).replace(/_[0-9a-f]{6}$/,"").replace(/_/g," "):"From header memory"):"Suggested tags";k.style.display="inline-flex";
   renderCols();
 }
 async function loadSheets(){
   const p=P();if(!p)return;$("err1").textContent="";
   const r=await api("/api/sheets?"+new URLSearchParams({path:p}));
   if(r.error){$("err1").textContent="Cannot read that file: "+r.error;return}
-  $("sheet").innerHTML=r.sheets.map(s=>`<option>${s.replace(/</g,"&lt;")}</option>`).join("");loadCols();
+  const best=r.sheets.reduce((a,s)=>s.cols>a.cols?s:a,r.sheets[0]);
+  $("sheet").innerHTML=r.sheets.map(s=>`<option value="${esc(s.name)}"${s===best?" selected":""}>${esc(s.name)} · ${s.cols} columns · ${s.status==="tagged"?"tagged":"suggested tags"}</option>`).join("");loadCols();
 }
 $("browse").onclick=()=>$("file").click();
 $("path").onchange=()=>{CUR=$("path").value.trim();loadSheets()};$("sheet").onchange=loadCols;$("filter").oninput=renderCols;$("flagged").onchange=renderCols;
@@ -678,7 +698,7 @@ $("restore").onclick=async()=>{
     const r=await fetchFile("/api/restore?"+q,{method:"POST",headers:{"Content-Type":"application/octet-stream"},body:rfile||undefined});
     const un=+r.headers.get("X-Unresolved");
     $("rstate").className="state ok";$("rstate").textContent="Downloaded";
-    $("rnote").textContent=`${r.headers.get("X-Restored")} values restored, ${r.headers.get("X-Dates")} dates rebuilt`+(un?`; ${un} tokens had no key and were left as they are.`:".");
+    $("rnote").textContent=`${r.headers.get("X-Restored")} values restored, ${r.headers.get("X-Dates")} dates rebuilt`+(un?`; ${un} tokens had no key and were left as they are`:"")+(+r.headers.get("X-Ambiguous")?`; ${r.headers.get("X-Ambiguous")} starred values match more than one person and stay masked.`:".");
   }catch(e){$("rstate").className="state fail";$("rstate").textContent=e.message}
   $("restore").disabled=false;
 };

@@ -75,17 +75,29 @@ def engine():
     return _engine
 
 
+def _trim(text, s, e):
+    """Drop label words stuck to a person span: 'Patient John Smith DOB' -> 'John Smith'."""
+    words = list(re.finditer(r"\S+", text[s:e]))
+    while words and ps.is_vocab(words[-1].group(0)):
+        words.pop()
+    while words and ps.is_vocab(words[0].group(0)):
+        words.pop(0)
+    return (s + words[0].start(), s + words[-1].end()) if words else None
+
+
 def _scan(text):
     """Analyze one text; return non-overlapping (start, end, entity) spans above threshold, longest first."""
     res = engine().analyze(text=text, language="en", entities=ENTITIES)
     res = [r for r in res if r.score >= MIN_SCORE.get(r.entity_type, 0.4)
-           and not (r.entity_type == "PERSON" and text[r.start:r.end].strip().lower() in ALLOW)]
+           and not (r.entity_type == "PERSON" and (text[r.start:r.end].strip().lower() in ALLOW
+                                                   or ps.is_vocab(text[r.start:r.end])))]
     res.sort(key=lambda r: (-(r.end - r.start), -r.score))
     taken, out = [], []
     for r in res:
-        if all(r.end <= s or r.start >= e for s, e in taken):
-            taken.append((r.start, r.end))
-            out.append((r.start, r.end, r.entity_type))
+        span = _trim(text, r.start, r.end) if r.entity_type == "PERSON" else (r.start, r.end)
+        if span and all(span[1] <= s or span[0] >= e for s, e in taken):
+            taken.append(span)
+            out.append((span[0], span[1], r.entity_type))
     return sorted(out)
 
 

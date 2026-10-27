@@ -8,7 +8,9 @@ disposition the agent picked. You are checking notes against dispositions only. 
 ## How to read a note
 - Notes often carry claim history (earlier calls, earlier denials, earlier submissions). Judge only what the agent did
   THIS touch: the concluding clause, usually after "hence", "therefore", "so", or the last sentences.
-- Placeholders like [NAME-AB12CD], [ID-123ABC], [PHONE-...], [D-34] are masked identifiers/dates. Ignore them.
+- Masked values keep only their first and last character, e.g. M***a L***z (a name), 1*******9 (a claim or
+  reference number), (2**) ***-***7 (a phone). Tokens like [CLM-AB12CD] are masked IDs. Treat them as "a name",
+  "a number" and so on, and ignore their content.
   [D-34] means 34 days before the work date; use it only for timing (TAT, timely filing).
 - CPT/HCPCS, ICD-10, CARC/RARC codes and $ amounts are real and may help.
 

@@ -14,6 +14,7 @@ Roles (one per column header):
 Columns left as 'Not PHI' are NOT masked. daily_mask.py still warns if one looks like SSN/phone/email.
 """
 import io
+import hashlib
 import json
 import re
 import subprocess
@@ -27,15 +28,24 @@ import pandas as pd
 import daily_mask as dm
 import headermem as hm
 
-ROLES = ["Not PHI", "Identifier", "Date", "Free text", "Drop"]
-from mask_columns_logic import guess_kind, guess_role  # noqa: E402
+from mask_columns_logic import ROLES, guess_kind, guess_role  # noqa: E402
+
+
+def config_name(filename, cols):
+    """One config per header set: 'AR Audit Result 2026-10-23.xlsx' and next week's file share a name."""
+    label = re.sub(r"[\s_-]*\(?\d[\d\s()_-]*\)?(?:\(old\))?$", "", Path(str(filename)).stem, flags=re.I)
+    label = re.sub(r"\d{4}-\d{2}-\d{2}", "", label).strip(" _-") or "Sheet"
+    sig = hashlib.sha1("|".join(sorted(hm.norm(c) for c in cols)).encode()).hexdigest()[:6]
+    return re.sub(r"\W+", "_", label)[:30] + "_" + sig
 
 
 def profile_from_roles(name, roles):
-    return {"name": name, "match": [c for c, r in roles.items() if r != "Not PHI"] or list(roles),
+    """The whole header set identifies the report type, so each of your file types keeps its own config."""
+    return {"name": name, "match": list(roles),
+            "phi": [c for c, r in roles.items() if r == "PHI"],
             "tokens": {c: hm.kind_for(c, guess_kind) for c, r in roles.items() if r == "Identifier"},
             "dates": [c for c, r in roles.items() if r == "Date"],
-            "text": [c for c, r in roles.items() if r == "Free text"],
+            "text": [c for c, r in roles.items() if r == "Text"],
             "drop": [c for c, r in roles.items() if r == "Drop"]}
 
 
@@ -102,10 +112,10 @@ class App(tk.Tk):
         if not self.vars:
             return
         roles = {c: v.get() for c, v in self.vars.items()}
-        name = re.sub(r"\W+", "_", f"{self.path.stem}_{self.sheet.get()}")[:40]
+        name = config_name(self.path.name, list(roles))
         remember(roles)
         save_profile(profile_from_roles(name, roles))
-        marked = sum(r != "Not PHI" for r in roles.values())
+        marked = sum(r != "No PHI" for r in roles.values())
         if run:
             cmd = ([sys.executable, "mask"] if getattr(sys, "frozen", False)
                    else [sys.executable, str(Path(__file__).with_name("ar_audit.py")), "mask"]) + [str(self.path)]

@@ -6,3 +6,4 @@ __pycache__/
 
 header_memory.json
 column_profiles.json
+*.json.bak-*

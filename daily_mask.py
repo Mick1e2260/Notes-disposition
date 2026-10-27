@@ -58,7 +58,8 @@ PROFILES = {
 }
 PROFILE_FILE = Path(__file__).with_name("column_profiles.json")  # written by mask_columns.py (headers + roles only, no data)
 ALLOW_COLS = ["Payer", "Payer Name", "Insurance Group", "Client", "Client Name", "Location", "Facility"]  # not PHI: never masked as people
-SKIP_KINDS = {"CLM", "AGT", "EMP", "BIL", "ACC", "USR", "PRV", "MRN", "PAT"}  # structured-column tokens (not swept as text)
+SKIP_KINDS = {"CLM", "AGT", "EMP", "BIL", "ACC", "USR", "PRV", "MRN", "PAT", "PHI"}  # column values: not swept as text
+NAME_KINDS = {"PAT", "PHI"}  # ...except names, which are also masked wherever they appear inside a sentence
 
 
 def private_setup():
@@ -74,10 +75,17 @@ def private_setup():
     return salt_file.read_text().strip()
 
 
+def newest_sources():
+    """Source files newest first; copies marked (OLD) and Excel lock files are skipped."""
+    fs = [f for f in SOURCE_DIR.glob(PATTERN) if not f.name.startswith("~$") and not re.search(r"\bold\b", f.stem, re.I)] \
+        if SOURCE_DIR.exists() else []
+    return sorted(fs, key=lambda p: p.stat().st_mtime, reverse=True)
+
+
 def pick_sources(args):
     if args:
         return [Path(p) for p in args]
-    files = sorted(SOURCE_DIR.glob(PATTERN), key=lambda p: p.stat().st_mtime, reverse=True)
+    files = newest_sources()
     if not files:
         raise SystemExit(f"No '{PATTERN}' in {SOURCE_DIR}")
     return files[:1]
@@ -93,7 +101,7 @@ def anchor_date(path, override):
 def saved_profiles():
     if PROFILE_FILE.exists():
         return {f"saved:{p['name']}": dict(detect=set(p["match"]), tokens=p.get("tokens", {}), dates=p.get("dates", []),
-                                           text=p.get("text", []), drop=p.get("drop", []), marked=True)
+                                           text=p.get("text", []), drop=p.get("drop", []), phi=p.get("phi", []), marked=True)
                 for p in json.loads(PROFILE_FILE.read_text(encoding="utf-8")).get("profiles", [])}
     return {}
 
@@ -101,9 +109,9 @@ def saved_profiles():
 def detect_profile(cols):
     """A profile you marked in mask_columns.py wins; otherwise the built-in sheet types."""
     allp = {**saved_profiles(), **PROFILES}
-    for name, p in allp.items():
-        if p["detect"] <= set(cols):
-            return name
+    fits = [(len(p["detect"]), name) for name, p in allp.items() if p["detect"] <= set(cols)]
+    if fits:
+        return max(fits)[1]  # the most specific config wins (your saved configs list every header)
     if hm.coverage(cols) >= hm.COVERAGE:  # a new sheet made mostly of headers you have already decided on
         return "memory"
     return None
@@ -117,22 +125,49 @@ def builtin_profile(cols):
     return None
 
 
-def get_profile(name, cols=None):
-    if name == "memory":
-        import mask_columns_logic as mcl
-        return hm.profile_from_memory(cols, mcl.guess_role, mcl.guess_kind)[0]
+def suggested(cols, df=None):
+    """Header memory first, then a guess from the header name and (when given) the values."""
+    import mask_columns_logic as mcl
+    guess = (lambda c: mcl.guess_role_data(c, df[c])) if df is not None else mcl.guess_role
+    return hm.profile_from_memory(cols, guess, mcl.guess_kind)
+
+
+def get_profile(name, cols=None, df=None):
+    if name in ("memory", "suggest"):
+        return suggested(cols, df)[0]
     return {**saved_profiles(), **PROFILES}[name]
 
 
-def load_sheets(raw):
-    """Every sheet whose headers match a profile -> [(sheet name, profile, DataFrame)]."""
+def find_header_row(xl, sheet, scan=15):
+    """Report exports often put a title and blank rows above the real header row: take the first row with the most
+    text cells (Worked Claims: title, blank, then the headers on row 3)."""
+    top = pd.read_excel(xl, sheet, header=None, nrows=scan)
+    best, best_n = 0, 0
+    for i, row in top.iterrows():
+        n = sum(isinstance(v, str) and v.strip() != "" for v in row)
+        if n > best_n:
+            best, best_n = i, n
+    return best
+
+
+def read_sheet(xl, sheet, nrows=None):
+    return pd.read_excel(xl, sheet, header=find_header_row(xl, sheet), nrows=nrows)
+
+
+def load_sheets(raw, suggest_all=False):
+    """Every sheet -> [(sheet name, profile, DataFrame)]. A sheet without saved tags uses the suggested tags when
+    suggest_all (the UI shows them first); a headless run skips it unless header memory covers it."""
     xl = pd.ExcelFile(io.BytesIO(raw))
     found = []
     for name in xl.sheet_names:
-        df = pd.read_excel(xl, name)
+        df = read_sheet(xl, name)
         prof = detect_profile(df.columns)
+        if suggest_all and (prof is None or prof in PROFILES):
+            prof = "suggest"
         if prof:
             found.append((name, prof, df))
+        else:
+            print(f"  skipped sheet '{name}': no tags for its headers yet (tag them in the UI, or run with --suggest)")
     if not found:
         raise SystemExit(f"No sheet matches a saved or built-in profile: {xl.sheet_names}. "
                          "Run `python mask_columns.py` to mark which columns contain PHI.")
@@ -156,9 +191,9 @@ def sweep(series, extra_names=None):
         if kind not in SKIP_KINDS and len(orig) >= 4:
             m[orig.lower()] = tok
     for tok, kind, orig in ps.key_rows:
-        if kind == "PAT":
+        if kind in NAME_KINDS:  # "MORENO, PABLA" in the name column also catches "Pabla Moreno" / "Pabla" in notes
             for v in name_variants(orig):
-                m.setdefault(v.lower(), tok)
+                m.setdefault(v.lower(), tok if tok.startswith("[") else ps.star(v))
     if not m:
         return series
     rx = re.compile(r"(?<![\w\[])(" + "|".join(re.escape(n) for n in sorted(m, key=len, reverse=True)) + r")(?![\w\]])", re.I)
@@ -166,22 +201,26 @@ def sweep(series, extra_names=None):
 
 
 def mask(df, prof, anchor, use_presidio):
-    p = get_profile(prof, list(df.columns))
-    out = df.drop(columns=[c for c in ps.DROP_COLS + p.get("drop", []) if c in df.columns]).copy()
-    for col, kind in p["tokens"].items():
+    p = get_profile(prof, list(df.columns), df)
+    fixed_drops = ps.DROP_COLS if prof in PROFILES else []  # your own config decides drops for everything else
+    out = df.drop(columns=[c for c in fixed_drops + p.get("drop", []) if c in df.columns]).copy()
+    for col in p.get("phi", []):  # whole value starred: SMITH, JOHN -> S***H, J**N
         if col in out.columns:
-            out[col] = df[col].map(lambda v, k=kind: ps.token(k, v) if pd.notna(v) else v)
+            out[col] = df[col].map(lambda v: ps.token("PHI", v, "star") if pd.notna(v) and str(v).strip() else v)
+    for col, kind in p["tokens"].items():  # stable token you can group on and restore exactly
+        if col in out.columns:
+            out[col] = df[col].map(lambda v, k=kind: ps.token(k, v, "token") if pd.notna(v) else v)
     worked = pd.to_datetime(df["Worked Date"]) if "Worked Date" in df.columns else pd.Series(anchor, index=df.index)
     for c in p["dates"]:
         if c in df.columns:
             out[c] = (pd.to_datetime(df[c], errors="coerce") - worked.dt.normalize()).dt.days
             out = out.rename(columns={c: f"{c} (days vs worked)"})
-    if prof == "memory":
-        import mask_columns_logic as mcl
-        guessed = hm.profile_from_memory(list(df.columns), mcl.guess_role, mcl.guess_kind)[1]
+    if prof in ("memory", "suggest"):
+        guessed = suggested(list(df.columns), df)[1]
         if guessed:
-            print(f"  NOTE: headers not in memory, role guessed from the name (review in the UI): {', '.join(map(str, guessed))}")
+            print(f"  NOTE: '{', '.join(map(str, guessed))}' used suggested tags (not tagged before; review them in the UI)")
     text_cols = [c for c in p["text"] if c in df.columns]
+    ps.VOCAB = sheet_vocab(df, p)
     if use_presidio and text_cols:
         import presidio_layer as pl
         pl.allow(v for c in ALLOW_COLS if c in df.columns for v in df[c].dropna().astype(str).unique())
@@ -196,12 +235,26 @@ def mask(df, prof, anchor, use_presidio):
         risk = risk.where(r == "", r)
     out["Residual Risk"] = risk
     if p.get("marked"):
-        handled = set(p["tokens"]) | set(p["dates"]) | set(p["text"]) | set(p.get("drop", []))
+        handled = set(p["tokens"]) | set(p["dates"]) | set(p["text"]) | set(p.get("drop", [])) | set(p.get("phi", []))
         warn_unmarked(df, [c for c in df.columns if c not in handled])
     return out
 
 
 SENSITIVE = re.compile(r"\b\d{3}-\d{2}-\d{4}\b|[\w.+-]+@[\w-]+\.[\w.]+|\(?\b\d{3}\)?[\s.-]\d{3}[\s.-]\d{4}\b")
+
+
+def sheet_vocab(df, p):
+    """Words from this sheet's No PHI category-style columns (Last Resolution Action, Status Source, RCA...):
+    phrases built only from them are statuses, not people, so the name rules leave them alone in the notes."""
+    tagged = set(p["tokens"]) | set(p["dates"]) | set(p["text"]) | set(p.get("phi", [])) | set(p.get("drop", []))
+    words = set()
+    for c in df.columns:
+        s = df[c].dropna()
+        if c in tagged or s.empty or not s.map(lambda v: isinstance(v, str)).all():
+            continue
+        if s.nunique() <= max(60, 0.05 * len(s)):
+            words |= {w.lower() for v in s.unique() for w in re.findall(r"[A-Za-z]{2,}", v)}
+    return words
 
 
 def warn_unmarked(df, cols):
@@ -214,12 +267,12 @@ def warn_unmarked(df, cols):
                       "Mark it in mask_columns.py if it holds PHI.")
 
 
-def process(raw, filename, anchor, use_presidio=True):
+def process(raw, filename, anchor, use_presidio=True, suggest_all=False):
     """Mask every matching sheet of a workbook given as bytes. Returns the masked file's path.
     `raw` is never written anywhere; only masked output, the quarantine file and the private key are."""
     ps.SALT = private_setup()
     MASKED_DIR.mkdir(parents=True, exist_ok=True)
-    sheets = load_sheets(raw)
+    sheets = load_sheets(raw, suggest_all)
     stem = re.sub(r"\s*\(\d+\)$", "", Path(filename).stem)
     safe_path = MASKED_DIR / f"{stem} - MASKED.xlsx"
     ps.key_rows.clear()
@@ -237,7 +290,7 @@ def process(raw, filename, anchor, use_presidio=True):
             print(line)
             if len(quar):
                 print(quar["Residual Risk"].str.split(", ").explode().value_counts().to_string())
-    key = pd.DataFrame(ps.key_rows, columns=["Token", "Type", "Original"]).drop_duplicates("Token")
+    key = pd.DataFrame(ps.key_rows, columns=["Token", "Type", "Original"]).drop_duplicates(["Token", "Original"])
     key.to_excel(PRIVATE_DIR / f"{stem} - REID KEY {datetime.now():%Y%m%d-%H%M%S}.xlsx", index=False)
     print(f"masked -> {safe_path} | tokens {len(key)}")
     return safe_path
@@ -248,9 +301,10 @@ def main():
     ap.add_argument("workbook", nargs="*")
     ap.add_argument("--date")
     ap.add_argument("--no-presidio", action="store_true")
+    ap.add_argument("--suggest", action="store_true", help="mask sheets you have not tagged with the suggested tags")
     a = ap.parse_args()
-    for src in pick_sources(a.workbook):
-        process(src.read_bytes(), src.name, anchor_date(src, a.date), not a.no_presidio)  # source stays in memory
+    for src in pick_sources(a.workbook):  # source stays in memory
+        process(src.read_bytes(), src.name, anchor_date(src, a.date), not a.no_presidio, a.suggest)
 
 
 if __name__ == "__main__":

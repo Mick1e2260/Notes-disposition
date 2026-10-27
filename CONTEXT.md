@@ -227,3 +227,33 @@ punctuation. A new sheet pre-fills remembered headers and tags only unseen ones 
 built-in profile but 70%+ of its headers are remembered, `daily_mask.py` masks it with no UI (unseen headers are guessed from the name
 and listed in the log). Below 70% it refuses rather than guess. The file holds headers/roles only, no data; it is gitignored.
 `mask_columns_logic.py` holds the header-name guesses (no GUI dependency).
+
+
+### Redesign: 6 header tags, one config per file type (27-Oct-2026)
+Workflow: add a workbook -> headers appear in ~0.5 s with suggested tags -> confirm the tags -> Run -> download the masked Excel.
+Each of the three report types (AR Audit Result, Worked Claims, Aged AR / WFM) gets its own config, named from the file name
+without its date plus a hash of the full header set, so next week's file is recognised automatically.
+
+| Tag | What happens to the cell |
+|---|---|
+| No PHI | unchanged |
+| PHI | whole value starred, first and last character kept per word: SMITH, JOHN -> S***H, J**N; a number is one unit: (214) 555-0187 -> (2**) ***-***7 |
+| Identifier | stable token you can group on and restore exactly: [CLM-AB12CD] |
+| Date | days from the work date |
+| Text | sentence kept; only names, numbers, phones, emails, addresses inside it are starred: "spoke with M***a L***z ref # 4**5, claim 1*******9" |
+| Drop | column removed |
+
+- Header row found automatically (Worked Claims has a title and a blank row above its headers); title rows are not copied.
+- Every sheet goes into the masked workbook. An untagged sheet uses the suggested tags shown in the UI (header memory first, then
+  header name, then values: a No PHI column holding sentences or phone/SSN/ID-looking values is suggested as Text).
+- Guesses: patient/responsible/rep names, phone, email, address, zip -> PHI; MRN, claim #, account #, member ID, agent, user -> Identifier;
+  money, counts, statuses, codes, payer/client/facility -> No PHI.
+- Name guard: a candidate name made only of RCM words, or of words from that sheet's own status/action/category columns
+  ("Appeal Submitted", "INSURANCE PLAN, EOB"), is not masked; "per Final Status Action Matrix" is not a person. Placeholders the
+  source already contains ("[CLAIM NUMBER-12]") are left as they are.
+- Restore: Identifier tokens come back exactly; starred values come back only when unambiguous (John and Joan both star to J**n,
+  so J**n stays masked rather than restoring the wrong person). DOB-style far dates stay [DATE].
+- Configs/header memory: AR_AUDIT_CONFIG_DIR (default: next to the app). The pre-redesign files were kept as
+  column_profiles.json.bak-2026-10-27-old-roles and header_memory.json.bak-2026-10-27-old-roles.
+- Real AR Audit file (23-Oct, 8 sheets, suggested tags): every sheet masked; Findings 1,349 of 1,351 rows kept (2 quarantined);
+  notes median 5.3% of characters starred, 90th percentile 11%.

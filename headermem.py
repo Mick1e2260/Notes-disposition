@@ -12,6 +12,8 @@ import re
 from datetime import datetime
 from pathlib import Path
 
+from mask_columns_logic import norm_role
+
 FILE = Path(__file__).with_name("header_memory.json")  # ar_audit.py points this next to the exe when frozen
 COVERAGE = 0.7  # share of a sheet's headers that must be remembered before a headless run trusts the memory
 _cache = {"mtime": None, "data": {}}
@@ -37,7 +39,8 @@ def _seed():
     out = {}
     if pf.exists():
         for p in json.loads(pf.read_text(encoding="utf-8")).get("profiles", []):
-            for role, cols in (("Date", p.get("dates", [])), ("Free text", p.get("text", [])), ("Drop", p.get("drop", []))):
+            for role, cols in (("Date", p.get("dates", [])), ("Text", p.get("text", [])),
+                               ("PHI", p.get("phi", [])), ("Drop", p.get("drop", []))):
                 for c in cols:
                     out[norm(c)] = {"name": c, "role": role, "seen": 1}
             for c, k in p.get("tokens", {}).items():
@@ -46,7 +49,8 @@ def _seed():
 
 
 def lookup(col):
-    return _data().get(norm(col))
+    e = _data().get(norm(col))
+    return {**e, "role": norm_role(e["role"])} if e else None
 
 
 def remember(roles, kind_for=None):
@@ -84,8 +88,9 @@ def profile_from_memory(cols, guess_role, guess_kind):
     """Ad-hoc profile for a sheet: remembered roles where known, header-name guesses for the rest. Returns (profile, guessed)."""
     roles, src = role_map(cols, guess_role, guess_kind)
     prof = {"detect": set(cols), "marked": False,
+            "phi": [c for c, r in roles.items() if r == "PHI"],
             "tokens": {c: kind_for(c, guess_kind) for c, r in roles.items() if r == "Identifier"},
             "dates": [c for c, r in roles.items() if r == "Date"],
-            "text": [c for c, r in roles.items() if r == "Free text"],
+            "text": [c for c, r in roles.items() if r == "Text"],
             "drop": [c for c, r in roles.items() if r == "Drop"]}
     return prof, [c for c, s in src.items() if s == "guessed"]

@@ -44,9 +44,10 @@ def run(mod_main, argv):
 def main():
     cmd, rest = (sys.argv[1], sys.argv[2:]) if len(sys.argv) > 1 else ("ui", [])
     import daily_mask as dm
-    dm.PROFILE_FILE = BASE / "column_profiles.json"
+    cfg = Path(os.environ.get("AR_AUDIT_CONFIG_DIR") or BASE)  # saved configs + header memory (headers only)
+    dm.PROFILE_FILE = cfg / "column_profiles.json"
     import headermem
-    headermem.FILE = BASE / "header_memory.json"
+    headermem.FILE = cfg / "header_memory.json"
     if cmd == "ui":
         import webui
         webui.main(network="--network" in rest)
