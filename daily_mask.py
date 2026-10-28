@@ -31,6 +31,7 @@ import pandas as pd
 
 import headermem as hm
 import phi_scrub as ps
+import phiscan
 
 SOURCE_DIR = Path(os.environ.get("AR_AUDIT_SOURCE_DIR", r"C:\Users\mick.harper\OneDrive - Anka"))
 MASKED_DIR = Path(os.environ.get("AR_AUDIT_MASKED_DIR", r"C:\AI_Agents\Notes-Disposition-Automation\masked_out"))
@@ -58,7 +59,7 @@ PROFILES = {
 }
 PROFILE_FILE = Path(__file__).with_name("column_profiles.json")  # written by mask_columns.py (headers + roles only, no data)
 ALLOW_COLS = ["Payer", "Payer Name", "Insurance Group", "Client", "Client Name", "Location", "Facility"]  # not PHI: never masked as people
-SKIP_KINDS = {"CLM", "AGT", "EMP", "BIL", "ACC", "USR", "PRV", "MRN", "PAT", "PHI"}  # column values: not swept as text
+SKIP_KINDS = {"NUM", "CLM", "AGT", "EMP", "BIL", "ACC", "USR", "PRV", "MRN", "PAT", "PHI"}  # column values: not swept as text
 NAME_KINDS = {"PAT", "PHI"}  # ...except names, which are also masked wherever they appear inside a sentence
 
 
@@ -234,37 +235,31 @@ def mask(df, prof, anchor, use_presidio):
         r = out[c].map(ps.residual)
         risk = risk.where(r == "", r)
     out["Residual Risk"] = risk
-    if p.get("marked"):
-        handled = set(p["tokens"]) | set(p["dates"]) | set(p["text"]) | set(p.get("drop", [])) | set(p.get("phi", []))
-        warn_unmarked(df, [c for c in df.columns if c not in handled])
+    # a column left as No PHI that still holds something the masking rules would mask -> warn (never changed here)
+    handled = set(p["tokens"]) | set(p["dates"]) | set(p["text"]) | set(p.get("drop", [])) | set(p.get("phi", []))
+    untagged = [c for c in df.columns if c not in handled and c in out.columns]
+    cand = vocab_candidates(df, p)
+    out.attrs["phi_warnings"] = phiscan.scan_columns(
+        df, untagged, anchor, {c: set().union(*[w for k, w in cand.items() if k != c]) for c in untagged})
     return out
 
 
-SENSITIVE = re.compile(r"\b\d{3}-\d{2}-\d{4}\b|[\w.+-]+@[\w-]+\.[\w.]+|\(?\b\d{3}\)?[\s.-]\d{3}[\s.-]\d{4}\b")
-
-
-def sheet_vocab(df, p):
-    """Words from this sheet's No PHI category-style columns (Last Resolution Action, Status Source, RCA...):
-    phrases built only from them are statuses, not people, so the name rules leave them alone in the notes."""
+def vocab_candidates(df, p):
+    """{column: words} for this sheet's No PHI category-style columns (Last Resolution Action, Status Source, RCA...).
+    Phrases built only from these words are statuses, not people, so the name rules leave them alone."""
     tagged = set(p["tokens"]) | set(p["dates"]) | set(p["text"]) | set(p.get("phi", [])) | set(p.get("drop", []))
-    words = set()
+    cand = {}
     for c in df.columns:
         s = df[c].dropna()
         if c in tagged or s.empty or not s.map(lambda v: isinstance(v, str)).all():
             continue
         if s.nunique() <= max(60, 0.05 * len(s)):
-            words |= {w.lower() for v in s.unique() for w in re.findall(r"[A-Za-z]{2,}", v)}
-    return words
+            cand[c] = {w.lower() for v in s.unique() for w in re.findall(r"[A-Za-z]{2,}", v)}
+    return cand
 
 
-def warn_unmarked(df, cols):
-    """You told us these columns are not PHI and they are left untouched; flag any that look like it anyway."""
-    for c in cols:
-        if df[c].dtype == object:
-            n = int(df[c].dropna().astype(str).str.contains(SENSITIVE).sum())
-            if n:
-                print(f"  WARNING: unmarked column '{c}' has {n} cells that look like SSN/phone/email. "
-                      "Mark it in mask_columns.py if it holds PHI.")
+def sheet_vocab(df, p):
+    return set().union(*vocab_candidates(df, p).values())
 
 
 def process(raw, filename, anchor, use_presidio=True, suggest_all=False):
@@ -276,9 +271,14 @@ def process(raw, filename, anchor, use_presidio=True, suggest_all=False):
     stem = re.sub(r"\s*\(\d+\)$", "", Path(filename).stem)
     safe_path = MASKED_DIR / f"{stem} - MASKED.xlsx"
     ps.key_rows.clear()
+    warnings = []
     with pd.ExcelWriter(safe_path) as ws, pd.ExcelWriter(MASKED_DIR / f"{stem} - QUARANTINE.xlsx") as wq:
         for name, prof, df in sheets:
             out = mask(df, prof, anchor, use_presidio)
+            for w in out.attrs.get("phi_warnings", []):
+                warnings.append({"Sheet": name, "Column": w["column"], "Found (cells)": w["found"],
+                                 "Cells checked": w["cells"], "Tagged as": "No PHI", "Suggested tag": w["suggest"]})
+                print(f"  WARNING: {name} | {w['column']} | {w['found']} | {w['suggest']}")
             safe = out[out["Residual Risk"] == ""].drop(columns="Residual Risk")
             quar = out[out["Residual Risk"] != ""]
             safe.to_excel(ws, sheet_name=name[:31], index=False)
@@ -290,6 +290,10 @@ def process(raw, filename, anchor, use_presidio=True, suggest_all=False):
             print(line)
             if len(quar):
                 print(quar["Residual Risk"].str.split(", ").explode().value_counts().to_string())
+        if warnings:  # the flag travels with the file: anyone opening the masked workbook sees which columns to double-check
+            pd.DataFrame(warnings).to_excel(ws, sheet_name="PHI Warnings", index=False)
+    if warnings:
+        print(f"  {len(warnings)} column(s) tagged No PHI still look sensitive: see the PHI Warnings sheet")
     key = pd.DataFrame(ps.key_rows, columns=["Token", "Type", "Original"]).drop_duplicates(["Token", "Original"])
     key.to_excel(PRIVATE_DIR / f"{stem} - REID KEY {datetime.now():%Y%m%d-%H%M%S}.xlsx", index=False)
     print(f"masked -> {safe_path} | tokens {len(key)}")

@@ -29,6 +29,7 @@ import gui
 import headermem as hm
 import mask_columns as mc
 import mask_columns_logic as ml
+import phiscan
 import phi_scrub as ps
 import reidentify
 
@@ -78,16 +79,6 @@ def sheets_of(path):
 
 _DF = {}  # (path, mtime, sheet) -> DataFrame, memory only (never written to disk)
 SAMPLE = 400  # headers appear at once; stats and previews use the first rows (the full sheet is only read by Run)
-PATTERNS = {
-    "phone": re.compile(r"\(?\b\d{3}\)?[\s.-]\d{3}[\s.-]\d{4}\b"),
-    "email": re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+"),
-    "ssn": re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),
-    "date": re.compile(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b"),
-    "id": re.compile(r"\b(?=[A-Z0-9-]*\d[A-Z0-9-]*\d[A-Z0-9-]*\d[A-Z0-9-]*\d[A-Z0-9-]*\d)[A-Z0-9][A-Z0-9-]{5,}\b", re.I),
-    "name": re.compile(r"\b[A-Z][a-z]+,? [A-Z][a-z]+\b|\b[A-Z]{2,}, [A-Z]{2,}\b"),
-}
-
-
 def frame(path, sheet):
     mem = str(path).startswith("mem:")
     key = (str(path), 0 if mem else Path(path).stat().st_mtime, sheet)
@@ -101,19 +92,16 @@ def shape(v):
     return re.sub(r"[a-z]", "a", re.sub(r"[A-Z]", "A", re.sub(r"\d", "9", str(v)[:28])))
 
 
-def col_stats(s):
-    """Facts about a column that do not reveal its values: fill, distinct, type, pattern hits, value shapes."""
+def col_stats(s, anchor=None, vocab=None):
+    """Facts about a column that do not reveal its values: fill, distinct, type, what the masking rules find, value shapes."""
     nn = s.dropna()
     txt = nn.astype(str)
     out = {"rows": int(len(s)), "filled": round(len(nn) / max(len(s), 1) * 100), "distinct": int(nn.nunique()),
            "type": "date" if pd.api.types.is_datetime64_any_dtype(s) else "number" if pd.api.types.is_numeric_dtype(s) else "text",
            "avg_len": int(txt.str.len().mean()) if len(txt) else 0}
-    out["hits"] = {}
-    if out["type"] == "text":
-        out["hits"] = {k: int(txt.str.contains(rx).sum()) for k, rx in PATTERNS.items() if k != "name"}
-        # "Follow-Up Required" looks like a name to the pattern; only count cells with a name that is not RCM vocabulary
-        out["hits"]["name"] = int(txt.map(lambda v: any(not ps.is_vocab(m.group(0)) for m in PATTERNS["name"].finditer(v))).sum())
-    out["hits"] = {k: v for k, v in out["hits"].items() if v}
+    # same rules the masker uses: would it have masked anything in this column?
+    sc = phiscan.scan_series(s, anchor or datetime.now(), vocab)
+    out["hits"], out["hit_shapes"], out["suggest"], out["scanned"] = sc["hits"], sc["shapes"], sc["suggest"], sc["cells"]
     out["shapes"] = [[k, int(v)] for k, v in txt.map(shape).value_counts().head(3).items()] if out["type"] != "number" else []
     return out
 
@@ -123,10 +111,14 @@ def columns_of(path, sheet):
     cols = [str(c) for c in df.columns]
     roles, src = hm.role_map(cols, lambda c: ml.guess_role_data(c, df[c]), mc.guess_kind)
     prof = dm.detect_profile(cols)
-    ps.VOCAB = dm.sheet_vocab(df, {k: [c for c, r in roles.items() if r == role] for k, role in
-                                   (("tokens", "Identifier"), ("dates", "Date"), ("text", "Text"), ("phi", "PHI"), ("drop", "Drop"))})
-    return {"columns": cols, "roles": roles, "src": src, "profile": None if prof in dm.PROFILES else prof,
-            "stats": {str(c): col_stats(df[c]) for c in df.columns}}
+    cand = dm.vocab_candidates(df, {k: [c for c, r in roles.items() if r == role] for k, role in
+                                    (("tokens", "Identifier"), ("dates", "Date"), ("text", "Text"), ("phi", "PHI"), ("drop", "Drop"))})
+    ps.VOCAB = set().union(*cand.values()) if cand else set()
+    anchor = dm.anchor_date(Path(name_of(path)), None)
+    # every column is scanned (not only the ones tagged No PHI now), so choosing No PHI later flags instantly
+    stats = {str(c): col_stats(df[c], anchor, set().union(*[w for k, w in cand.items() if k != str(c)]) if cand else set())
+             for c in df.columns}
+    return {"columns": cols, "roles": roles, "src": src, "profile": None if prof in dm.PROFILES else prof, "stats": stats}
 
 
 def preview(path, sheet, col, role):
@@ -525,46 +517,89 @@ code{font:12.5px var(--mono)}.pv{display:grid;gap:5px;margin-top:6px}
 .fn{display:grid;min-width:0}.fn b{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}.fn small{color:var(--muted);font-size:12.5px}
 input[type=date]{min-height:40px}
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+
+/* Guided workspace */
+main{max-width:1040px} header{align-items:center;padding-bottom:24px}
+header h1{font-size:25px} .workspace-nav{display:flex;gap:8px;margin:28px 0 16px;flex-wrap:wrap}
+.navstep{display:flex;align-items:center;gap:9px;border:0;background:transparent;color:var(--muted);padding:8px 12px}
+.navstep .num{display:grid;place-items:center;width:27px;height:27px;border:1px solid var(--line);border-radius:50%;font-size:12px}
+.navstep.active{color:var(--accent);background:var(--accent-soft)}.navstep.active .num{background:var(--accent);color:var(--accent-ink);border-color:var(--accent)}
+section.panel{display:none;grid-template-columns:1fr;padding:32px;border:1px solid var(--line);border-radius:18px;background:var(--surface);box-shadow:0 12px 36px #1232;min-height:340px}
+section.panel.active{display:block;animation:rise .25s var(--ease)} section.panel>.step{margin-bottom:12px}
+section.panel h2{font-size:27px;margin-bottom:8px} section.panel .hint{font-size:15px;max-width:70ch}
+.actions{display:flex;justify-content:space-between;gap:12px;margin-top:28px;padding-top:20px;border-top:1px solid var(--line)}
+.feature-help{padding:15px 17px;background:var(--accent-soft);border-radius:10px;margin:14px 0;color:var(--ink)}
+.feature-help strong{display:block;margin-bottom:3px}.feature-help p{margin:0;font-size:13.5px}
+.options{display:grid;gap:12px;margin-top:16px}.options label{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.options .muted{display:block}
+#log{min-height:0;max-height:220px} details{margin-top:20px} summary{cursor:pointer;color:var(--muted);font-weight:600}
+.loading{position:fixed;inset:0;z-index:5;background:var(--bg);display:none;place-items:center;padding:24px}.loading.active{display:grid}
+.loading-card{text-align:center;max-width:440px}.spinner{width:70px;height:70px;border:5px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:spin 1s linear infinite;margin:0 auto 28px}
+@keyframes spin{to{transform:rotate(360deg)}} .loading h2{font-size:28px}.loading p{color:var(--muted)}
+@media(max-width:700px){section.panel{padding:22px}.navstep{padding:7px}.navstep .navlabel{display:none}.navstep.active .navlabel{display:inline}.actions{flex-wrap:wrap}}
+@media(prefers-reduced-motion:reduce){.spinner{animation:none;border-top-color:var(--accent);border-right-color:var(--accent)}}
+.flagbar{margin:12px 0 0;padding:12px 14px;border:1px solid var(--warn);border-radius:10px;font-size:13.5px}
+.flagbar b{color:var(--warn)}.flagbar ul{margin:6px 0 10px;padding-left:20px}.flagbar li{margin:2px 0}
+.warnbox{margin:16px 0;padding:14px 16px;border:1px solid var(--warn);border-radius:10px}
+.warnbox h3{margin:0 0 6px;font:600 15px var(--display);color:var(--warn)}
+.warnbox ul{margin:8px 0 12px;padding-left:20px}.warnbox li{margin:3px 0;font-size:13.5px}
+.hot{color:var(--warn);font-weight:600}button.small{min-height:30px;padding:0 12px;font-size:12.5px}
 </style></head><body><main>
 <header>
   <div><h1>AR Audit</h1><p class="sub">Mask PHI on this PC, then review notes with a local model. Nothing leaves this machine.</p></div>
   <div class="chips"><span class="chip" id="oll"><i></i><span>Ollama</span></span><button class="quiet" id="quit" title="Stop the local server">Quit</button></div>
 </header>
 
-<section><div class="step">Step 1</div><div>
+<nav class="workspace-nav" aria-label="Workflow steps">
+  <button class="navstep active" data-step="1"><span class="num">1</span><span class="navlabel">Workbook</span></button>
+  <button class="navstep" data-step="2"><span class="num">2</span><span class="navlabel">Column privacy</span></button>
+  <button class="navstep" data-step="3"><span class="num">3</span><span class="navlabel">Run options</span></button>
+  <button class="navstep" data-step="4"><span class="num">4</span><span class="navlabel">Results</span></button>
+  <button class="navstep" data-step="5"><span class="num">↺</span><span class="navlabel">Restore</span></button>
+</nav>
+<section class="panel active" id="step1"><div class="step">Step 1 of 4 · Choose a workbook</div><div>
   <h2>Workbook</h2><p class="hint">Defaults to the newest audit result in OneDrive. Only column headers are read here.</p>
   <div class="row"><input type="text" id="path" placeholder="Path to an .xlsx file" spellcheck="false"><button id="browse">Browse…</button></div>
   <div class="row" style="margin-top:10px"><select id="sheet" aria-label="Sheet"></select><span class="chip" id="kind" style="display:none"></span></div>
   <p class="muted" style="margin-top:8px">Every sheet goes into the masked file. A sheet you have not tagged uses the suggested tags; pick it here to check them. Title rows above the headers are found automatically.</p>
   <div class="drop" id="drop" tabindex="0" role="button" aria-label="Add a workbook">Drop an .xlsx here, or <u>add a workbook</u>. It is held in memory only and never saved.<input type="file" id="file" accept=".xlsx,.xlsm" hidden></div>
-  <div class="err" id="err1"></div>
+  <div class="err" id="err1" role="alert"></div>
+<div class="actions"><span></span><button class="primary" data-next="2">Continue to column privacy →</button></div>
 </div></section>
 
-<section><div class="step">Step 2</div><div>
+<section class="panel" id="step2"><div class="step">Step 2 of 4 · Review privacy</div><div>
   <h2>Which columns contain PHI</h2>
   <p class="hint">Tag each header once per file type; the next file with these headers is filled in for you. <b>PHI</b> keeps only the first and last character (S***H, J**N). <b>Text</b> keeps the sentence and masks only the names and numbers inside it.</p>
   <div class="row"><input type="text" id="filter" placeholder="Filter headers" style="max-width:260px;flex:none"><label class="chk"><input type="checkbox" id="flagged"> Only flagged</label></div>
+  <div class="flagbar" id="flagbar" hidden></div>
   <div class="cols" id="cols"></div>
   <div class="meta"><span id="count">No columns loaded</span><span class="row"><span class="state" id="saved"></span><button id="save">Save marks</button></span></div>
+<div class="actions"><button data-next="1">← Back</button><button class="primary" data-next="3">Continue to run options →</button></div>
 </div></section>
 
-<section><div class="step">Step 3</div><div>
+<section class="panel" id="step3"><div class="step">Step 3 of 4 · Configure</div><div>
   <h2>Run</h2><p class="hint">Masking always runs first. If it fails, the review is skipped.</p>
   <div class="row">
     <select id="mode" aria-label="What to run">
       <option value="mask">Masked Excel only</option><option value="auto">Masked Excel + LLM review (by sheet type)</option>
       <option value="review">Mask + audit review</option><option value="classify">Mask + classify (Open AR)</option></select>
-    <select id="model" aria-label="Model"></select>
-    <label class="chk">Max claims <input type="number" id="limit" min="0" value="0" title="0 = all"></label>
-    <label class="chk"><input type="checkbox" id="presidio" checked> Presidio + NER</label>
   </div>
-  <div class="row" style="margin-top:16px"><button class="primary" id="run">Run</button><button id="open">Open output folder</button><span class="state" id="state"></span></div>
-  <div class="bar" id="bar"><b></b></div>
-  <pre id="log"></pre>
-  <h3 class="rh">Results</h3><div id="results" class="files"></div>
+  <div class="feature-help" id="modeHelp"></div>
+  <div class="options">
+    <label>Local model <select id="model" aria-label="Model"></select> <span class="muted">Used for review and classification.</span></label>
+    <label>Max claims <input type="number" id="limit" min="0" value="0" title="0 = all"> <span class="muted">Limit the review; 0 processes all claims.</span></label>
+    <label class="chk"><input type="checkbox" id="presidio" checked> Presidio + NER <span class="muted">Adds entity detection to help identify sensitive text.</span></label>
+  </div>
+  <div class="actions"><button data-next="2">← Back</button><button class="primary" id="run">Start processing →</button></div>
+</div></section>
+<section class="panel" id="step4"><div class="step">Step 4 of 4 · Results</div><div>
+  <h2>Your results</h2><p class="hint">Download your processed files or open the output folder on this PC.</p>
+  <span class="state" id="state" role="status"></span><div class="warnbox" id="warnbox" hidden></div><div id="results" class="files"></div>
+  <div class="row" style="margin-top:20px"><button id="open">Open output folder</button><button data-next="5">Restore originals</button></div>
+  <details><summary>Processing details</summary><pre id="log"></pre></details>
+  <div class="actions"><button data-next="3">← Run options</button><button data-next="1">Start another workbook</button></div>
 </div></section>
 
-<section><div class="step">Step 4</div><div>
+<section class="panel" id="step5"><div class="step">Separate tool · Restore</div><div>
   <h2>Restore originals</h2>
   <p class="hint">Turns a masked workbook back into the real values using the private key on this PC. The restored file contains PHI: it is built in memory and downloaded straight to you, never saved here.</p>
   <div class="row"><select id="rsel" aria-label="Masked workbook"></select><span class="muted">or</span>
@@ -575,25 +610,40 @@ input[type=date]{min-height:40px}
   <p class="muted" id="rnote" style="margin-top:10px"></p>
 </div></section>
 </main>
+<div class="loading" id="loading" role="status" aria-live="polite"><div class="loading-card"><div class="spinner" aria-hidden="true"></div><h2>Processing your workbook</h2><p id="loadingText">Masking sensitive information. This may take a few minutes.</p><p>Please keep this window open.</p></div></div>
 <script>
 const T="__TOKEN__",$=id=>document.getElementById(id);
 const api=(p,o={})=>fetch(p,{...o,headers:{"X-Token":T,"Content-Type":"application/json"}}).then(r=>r.json());
 const post=(p,b)=>api(p,{method:"POST",body:JSON.stringify(b||{})});
 let CUR="",rfile=null;const P=()=>CUR;function setPath(p,d){CUR=p;$("path").value=d||p;loadSheets()}
-let roles={},ROLES=[],timer=null,since=0,STATS={},OPEN=new Set(),PREV={},SRC={};
+let roles={},ROLES=[],timer=null,since=0,STATS={},OPEN=new Set(),PREV={},SRC={},WARN=[];
+function goStep(n){
+  if((n===2||n===3)&&(!P()||!Object.keys(roles).length)){document.querySelectorAll('.panel').forEach(x=>x.classList.remove('active'));$('step1').classList.add('active');document.querySelectorAll('.navstep').forEach(x=>x.classList.toggle('active',x.dataset.step==='1'));$('err1').textContent='Choose a readable workbook before continuing.';return}
+  document.querySelectorAll('.panel').forEach(x=>x.classList.toggle('active',x.id==='step'+n));
+  document.querySelectorAll('.navstep').forEach(x=>{x.classList.toggle('active',x.dataset.step==n);if(x.dataset.step==n)x.setAttribute('aria-current','step');else x.removeAttribute('aria-current')});
+  window.scrollTo(0,0);
+}
+document.querySelectorAll('[data-step]').forEach(b=>b.onclick=()=>goStep(+b.dataset.step));
+document.querySelectorAll('[data-next]').forEach(b=>b.onclick=()=>goStep(+b.dataset.next));
+const modeDescriptions={mask:['Masked Excel only','Creates a masked workbook without running a model.'],auto:['Automatic review','Masks first, then selects a local model review based on the sheet type.'],review:['Audit review','Masks first, then reviews audit notes with the local model.'],classify:['Open AR classification','Masks first, then classifies Open AR notes with the local model.']};
+function showMode(){const d=modeDescriptions[$('mode').value];$('modeHelp').innerHTML=`<strong>${d[0]}</strong><p>${d[1]}</p>`;}
+$('mode').onchange=showMode;showMode();
 const known=()=>Object.keys(SRC).forEach(k=>SRC[k]="remembered");
 const esc=x=>String(x).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
-const HITLBL={phone:"phone numbers",email:"emails",ssn:"SSN-like",date:"dates",id:"long IDs",name:"name-like"};
+const HITLBL={phone:"phone numbers",email:"emails",ssn:"SSN-like numbers",address:"addresses",id:"IDs / long numbers",name:"person names",url:"links",dob:"dates of birth"};
 const ROLEHELP={"No PHI":"Left exactly as it is.","PHI":"Whole value masked, first and last character kept: S***H, J**N.","Identifier":"Each value becomes a stable token you can group on and restore: [CLM-AB12CD].","Date":"Becomes days from the work date.","Text":"Sentence kept; only names, numbers, phones and emails inside it are masked.","Drop":"Removed from the masked file."};
-const sens=c=>Object.entries((STATS[c]||{}).hits||{}).filter(([k])=>k!=="date").reduce((a,[,v])=>a+v,0);
+const sens=c=>Object.values((STATS[c]||{}).hits||{}).reduce((a,v)=>a+v,0);
 const flagged=c=>roles[c]==="No PHI"&&sens(c)>0;
+const foundText=c=>Object.entries((STATS[c]||{}).hits||{}).sort((a,b)=>b[1]-a[1]).map(([k,v])=>`${v} ${HITLBL[k]}`).join(", ");
 function detail(c){
   const s=STATS[c]||{},role=roles[c],pv=PREV[c+"|"+role];
-  const hits=Object.entries(s.hits||{}).map(([k,v])=>`<span class="tag ${role==="No PHI"&&k!=="date"?"warn":""}">${v} ${HITLBL[k]}</span>`).join("")||'<span class="muted">No phone, email, SSN, ID or name patterns found.</span>';
+  const hits=Object.entries(s.hits||{}).map(([k,v])=>`<span class="tag ${role==="No PHI"?"warn":""}">${v} ${HITLBL[k]}</span>`).join("")||'<span class="muted">The masking rules find nothing sensitive in this column.</span>';
   const shapes=(s.shapes||[]).map(([k,v])=>`<div><code>${esc(k)}</code><span>${v} cells</span></div>`).join("");
+  const sg=esc(s.suggest||"Text");
+  const fnote=flagged(c)?`<p class="warn-t">Tagged <b>No PHI</b>, but the masking rules would have masked this in ${sens(c)} of ${s.scanned} checked cells. Suggested tag: <b>${sg}</b>. <button class="small setrole" data-r="${sg}">Set to ${sg}</button></p>`:"";
   const dnote=role==="No PHI"&&s.type==="date"?'<p class="warn-t">Dates tied to a patient count as PHI under Safe Harbor. Consider “Date”.</p>':"";
   return `<div class="dgrid"><div><b>${s.filled}%</b><small>filled</small></div><div><b>${s.distinct}</b><small>distinct</small></div><div><b>${s.type}</b><small>type</small></div><div><b>${s.avg_len}</b><small>avg length</small></div></div>
-  <h4>Looks like</h4><div class="tags">${hits}</div>${dnote}
+  <h4>The masking rules find</h4><div class="tags">${hits}</div>${fnote}${dnote}
   ${shapes?`<h4>Common value shapes</h4><div class="shapes">${shapes}</div>`:""}
   <h4>After masking as “${esc(role)}”</h4><p class="muted">${ROLEHELP[role]}</p>
   <div class="pv">${pv?pv.map(x=>`<code>${esc(x)}</code>`).join(""):'<span class="muted">Loading…</span>'}</div>`;
@@ -609,18 +659,36 @@ function renderCols(){
     const w=document.createElement("div"),open=OPEN.has(c);w.className="colwrap"+(open?" open":"");
     const d=document.createElement("div");d.className="col";
     const n=document.createElement("button");n.className="cname";n.setAttribute("aria-expanded",open);n.title=c;
-    n.innerHTML=`<i class="chev"></i><span>${esc(c)}</span>${SRC[c]==="guessed"?'<em class="newtag" title="Not seen before: role guessed from the name. Confirm it, then Save or Run to remember it.">new</em>':""}${flagged(c)?`<em class="flag" title="Marked Not PHI but ${sens(c)} cells look sensitive">${sens(c)} look sensitive</em>`:""}`;
+    n.innerHTML=`<i class="chev"></i><span>${esc(c)}</span>${SRC[c]==="guessed"?'<em class="newtag" title="Not seen before: role guessed from the name. Confirm it, then Save or Run to remember it.">new</em>':""}${flagged(c)?`<em class="flag" title="Tagged No PHI, but the masking rules find: ${esc(foundText(c))}">⚠ ${sens(c)} sensitive</em>`:""}`;
     n.onclick=()=>{open?OPEN.delete(c):OPEN.add(c);if(!open)loadPrev(c);renderCols()};
     const g=document.createElement("div");g.className="seg";g.setAttribute("role","group");g.setAttribute("aria-label","Role for "+c);
     ROLES.forEach(r=>{const b=document.createElement("button");b.textContent=r;
       b.className=(roles[c]===r?"sel ":"")+(r==="Drop"?"isdrop":"");b.setAttribute("aria-pressed",roles[c]===r);
       b.onclick=()=>{roles[c]=r;$("saved").textContent="";if(OPEN.has(c))loadPrev(c);renderCols()};g.appendChild(b)});
     d.append(n,g);w.appendChild(d);
-    if(open){const x=document.createElement("div");x.className="detail";x.innerHTML=detail(c);w.appendChild(x)}
+    if(open){const x=document.createElement("div");x.className="detail";x.innerHTML=detail(c);
+      x.querySelectorAll(".setrole").forEach(b=>b.onclick=()=>{roles[c]=b.dataset.r;$("saved").textContent="";loadPrev(c);renderCols()});w.appendChild(x)}
     box.appendChild(w)});
   box.scrollTop=st;
   const all=Object.keys(roles),m=all.filter(c=>roles[c]!=="No PHI").length,fl=all.filter(flagged).length,nw=all.filter(c=>SRC[c]==="guessed").length;
-  $("count").textContent=all.length?`${m} of ${all.length} columns marked`+(nw?` · ${nw} new to review`:" · all remembered")+(fl?` · ${fl} unmarked look sensitive`:""):"No columns loaded";
+  $("count").className=fl?"hot":"";
+  $("count").textContent=all.length?`${m} of ${all.length} columns marked`+(nw?` · ${nw} new to review`:" · all remembered")+(fl?` · ⚠ ${fl} tagged No PHI look sensitive`:""):"No columns loaded";
+  renderFlagbar(all.filter(flagged));
+}
+function renderFlagbar(fl){
+  const b=$("flagbar");
+  if(!fl.length){b.hidden=true;b.innerHTML="";return}
+  b.hidden=false;
+  b.innerHTML=`<b>⚠ ${fl.length} column${fl.length>1?"s":""} tagged No PHI contain what the masking rules would mask</b><ul>${fl.slice(0,8).map(c=>`<li>${esc(c)}: ${esc(foundText(c))} → suggest ${esc(STATS[c].suggest||"Text")}</li>`).join("")}${fl.length>8?`<li>…and ${fl.length-8} more</li>`:""}</ul><div class="row"><button class="small" id="fbApply">Apply suggested tags</button><button class="small" id="fbShow">${$("flagged").checked?"Show all columns":"Show only these"}</button></div>`;
+  $("fbApply").onclick=()=>{fl.forEach(c=>roles[c]=STATS[c].suggest||"Text");$("saved").textContent="";OPEN.clear();renderCols()};
+  $("fbShow").onclick=()=>{$("flagged").checked=!$("flagged").checked;renderCols()};
+}
+function showWarnings(){
+  const b=$("warnbox");
+  if(!WARN.length){b.hidden=true;b.innerHTML="";return}
+  b.hidden=false;
+  b.innerHTML=`<h3>⚠ Check before sharing: ${WARN.length} column${WARN.length>1?"s":""} tagged No PHI still look sensitive</h3><p class="muted">These columns were left unchanged in the masked file. The same list is on its “PHI Warnings” sheet.</p><ul>${WARN.map(w=>`<li><b>${esc(w.col)}</b> (${esc(w.sheet)}): ${esc(w.found)} → suggest ${esc(w.suggest)}</li>`).join("")}</ul><button class="small" id="wbFix">Review these columns</button>`;
+  $("wbFix").onclick=()=>{const f=WARN.find(w=>[...$("sheet").options].some(o=>o.value===w.sheet));if(f)$("sheet").value=f.sheet;loadCols().then(()=>{$("flagged").checked=true;renderCols();goStep(2)})};
 }
 async function loadCols(){
   $("err1").textContent="";
@@ -646,17 +714,25 @@ $("open").onclick=()=>post("/api/open");
 $("quit").onclick=async()=>{await post("/api/quit");document.body.innerHTML='<main><h1>Stopped</h1><p class="sub">You can close this tab.</p></main>'};
 $("run").onclick=async()=>{
   const p=P();if(!p){$("err1").textContent="Pick a workbook first.";return}
-  $("log").textContent="";since=0;$("state").textContent="";$("run").disabled=true;$("bar").classList.add("on");
+  const bad=Object.keys(roles).filter(flagged);
+  if(bad.length&&!confirm(`${bad.length} column${bad.length>1?"s":""} tagged No PHI look sensitive:\n\n`+bad.slice(0,10).map(c=>`• ${c}: ${foundText(c)}`).join("\n")+`\n\nStart processing anyway?\n(Cancel goes back so you can review them.)`)){$("flagged").checked=true;goStep(2);renderCols();return}
+  WARN=[];showWarnings();
+  $("log").textContent="";since=0;$("state").textContent="";$("run").disabled=true;$("loading").classList.add("active");
+  try {
   if(Object.keys(roles).length){const m=await post("/api/profile",{path:p,sheet:$("sheet").value,roles});$("log").textContent=m.error?"":`Using the ${m.saved} column marks shown in Step 2 (saved and remembered).\n`;if(!m.error){known();renderCols()}}
   const r=await post("/api/run",{path:p,mode:$("mode").value,model:$("model").value,limit:+$("limit").value,presidio:$("presidio").checked,date:$("rdate").value});
-  if(r.error){$("log").textContent=r.error;$("run").disabled=false;$("bar").classList.remove("on");return}
+  if(r.error){$("log").textContent=r.error;$("run").disabled=false;$("loading").classList.remove("active");$("state").className="state fail";$("state").textContent=r.error;goStep(4);return}
   timer=setInterval(poll,700);
+  } catch(e){finishError(e)}
 };
+function finishError(e){clearInterval(timer);$('loading').classList.remove('active');$('run').disabled=false;$('state').className='state fail';$('state').textContent='Could not contact the local server. Check the connection and try again.';$('log').textContent=String(e);goStep(4)}
 async function poll(){
-  const r=await api("/api/job?since="+since);since=r.n;
-  if(r.lines.length){const l=$("log");l.textContent+=r.lines.join("\n")+"\n";l.scrollTop=l.scrollHeight}
-  if(r.done){clearInterval(timer);loadOutputs();$("run").disabled=false;$("bar").classList.remove("on");
-    $("state").className="state "+(r.ok?"ok":"fail");$("state").textContent=r.ok?"Done":"Failed"}
+  try {const r=await api("/api/job?since="+since);since=r.n;
+  if(r.lines.length){const l=$("log");l.textContent+=r.lines.join("\n")+"\n";l.scrollTop=l.scrollHeight;
+    r.lines.forEach(t=>{const m=t.match(/WARNING: (.+?) \| (.+?) \| (.+) \| (\w+)\s*$/);if(m)WARN.push({sheet:m[1],col:m[2],found:m[3],suggest:m[4]})})}
+  if(r.done){clearInterval(timer);loadOutputs();$("run").disabled=false;$("loading").classList.remove("active");
+    $("state").className="state "+(r.ok?"ok":"fail");$("state").textContent=r.ok?(WARN.length?"Processing complete, with warnings (see below)":"Processing complete"):"Processing failed. Open processing details for more information.";showWarnings();goStep(4)}
+  } catch(e){finishError(e)}
 }
 
 async function fetchFile(url,opts){

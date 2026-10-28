@@ -12,10 +12,11 @@ Outputs (in out_dir, default = next to the workbook):
 What is removed / replaced in notes:
   person names (rep, subscriber, patient), phone/fax, email, URL, SSN,
   street / PO Box addresses and ZIPs, every long ID (claim #, ICN, member ID,
-  auth #, call ref, EFT/check #, case #, batch #), calendar dates -> day offsets
-  from the Worked Date (e.g. [D-34]) so TFL/TAT logic still works.
+  auth #, call ref, EFT/check #, case #, batch #, card #), any other run of 4+ digits,
+  dates of birth (labelled DOB, or too far back to be a work date).
 What is kept (not identifiers under Safe Harbor, and needed for the audit):
-  CPT/HCPCS, ICD-10, modifiers, CARC/RARC, $ amounts, payer names, TAT/TFL wording.
+  work dates as written (DOS, billed/denied on ...), CPT/HCPCS, ICD-10, modifiers, CARC/RARC,
+  $ amounts, years, small counts (TFL 180 days), payer names, TAT/TFL wording.
 
 This lowers risk; it does not make data "de-identified" on its own say-so.
 Have compliance sign off on the method and on a reviewed sample before using
@@ -73,7 +74,7 @@ def token(kind, value, style=None):
 # --- note patterns, applied in order --------------------------------------
 MONTHS = r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*"
 DATE_RX = re.compile(
-    rf"(?<!\d)(\d{{1,2}})[/-](\d{{1,2}})[/-](\d{{2,4}})(?!\d)"            # 10/23/2026, 9/1/26
+    rf"(?<!\d)(\d{{1,2}})[/.-](\d{{1,2}})[/.-](\d{{2,4}})(?!\d)"          # 10/23/2026, 9/1/26, 09.16.2026
     rf"|\b({MONTHS})\.? (\d{{1,2}}),? (\d{{4}})\b",               # October 2, 2026
     re.I)
 NAME_TRIGGER = re.compile(
@@ -82,7 +83,7 @@ NAME_TRIGGER = re.compile(
     r"([A-Z][a-z]+(?:\s+[A-Z]\.?)?(?:\s+[A-Z][a-z]+)?)(?=[\s,.;]|$)")
 SUBSCRIBER_NAME = re.compile(
     r"\b((?:subscriber|patient|member|insured|pt)(?:'s)?\s*name\s*(?:is|as|:)?\s*)"
-    r"([A-Z][A-Za-z'-]+,?\s+[A-Z][A-Za-z'-]+(?:\s+[A-Z][A-Za-z'-]+)?)")
+    r"([A-Z][A-Za-z'-]+,?\s+[A-Z][A-Za-z'-]+(?:\s+(?!(?:DOB|DOS|MRN|SSN|ID|and|with)\b)[A-Z][A-Za-z'-]+)?)")
 # RCM words that NER and the name rules mistake for people ("Appeal Submitted", "INSURANCE PLAN, EOB").
 # A candidate name made only of these words (or of words from the sheet's own status/action/category columns) is kept.
 RCM_WORDS = set("""final status action matrix payer payers payor policy client team sop contract contractual guideline
@@ -108,7 +109,7 @@ def is_vocab(text):
     """True when every word is RCM vocabulary, so the text is a status/action phrase, not a person."""
     words = re.findall(r"[A-Za-z]{2,}", str(text))
     return bool(words) and all(w.lower() in RCM_WORDS or w.lower() in VOCAB for w in words)
-UPPER_NAME = re.compile(r"\b[A-Z]{2,}(?: [A-Z]{2,})?, [A-Z]{2,}(?: [A-Z]{2,})?\b")  # MORENO, PABLA
+UPPER_NAME = re.compile(r"\b[A-Z]{2,}(?: [A-Z]{2,})?, [A-Z]{2,}(?: (?!(?:DOB|DOS|MRN|SSN|ID)\b)[A-Z]{2,})?\b")  # MORENO, PABLA
 SUBS = [
     ("EMAIL", re.compile(r"[\w.*+-]+@[\w-]+\.[\w.]+")),
     ("URL", re.compile(r"https?://\S+|www\.\S+", re.I)),
@@ -119,14 +120,35 @@ SUBS = [
     ("ADDR", re.compile(r"\b\d{2,6}\s+(?:[NSEW]\.?\s+)?[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\s+"
                         r"(?:st|street|ave|avenue|rd|road|blvd|dr|drive|ln|lane|way|ct|pkwy|hwy|suite|ste)\b\.?[^.;\n]{0,40}", re.I)),
     ("ZIP", re.compile(r"\b[A-Z]{2}[\s,-]+\d{5}(?:-\d{4})?\b")),
+    # an alphanumeric ref after a label and # or : ("Ticket#PIQ-1234_x", "ref#S12AB") -> only the ref is masked
+    ("REF", re.compile(r"\b(?:ticket|reff?|reference|call\s*ref|confirmation|conf|case|auth|icn|dcn|draft|vcc|card)"
+                       r"\s*(?:no|number|num|id)?\s*[#:]+\s*-?\s*(?P<v>(?=[\w-]*\d)[A-Za-z0-9][\w-]{2,})", re.I)),
     # a number introduced by a reference word: only the number is masked ("claim 12345" -> "claim 1***5")
-    ("REF", re.compile(r"\b(?:claim|clm|icn|dcn|acct|account|member|mbr|subscriber|auth|authori[sz]ation|ref|reference|"
+    ("REF", re.compile(r"\b(?:vcc|card|draft|ticket|claim|clm|icn|dcn|acct|account|member|mbr|subscriber|auth|authori[sz]ation|ref|reference|"
                        r"case|batch|eft|check|cheque|trace|voucher|policy|seq|confirmation|ticket)\b"
                        r"(?:\s*(?:no|number|num|id|#))?[\s:#.=-]{0,4}(?P<v>\d{5,}|(?!(?:19|20)\d\d\b)\d{4})\b", re.I)),
     # long identifiers: masked (****46) or >=6 chars containing >=5 digits, e.g. claim#, ICN, member ID, EFT
     ("ID", re.compile(r"\*{2,}[\w-]*")),
     ("ID", re.compile(r"\b(?=[A-Z0-9-]*\d[A-Z0-9-]*\d[A-Z0-9-]*\d[A-Z0-9-]*\d[A-Z0-9-]*\d)[A-Z0-9][A-Z0-9-]{5,}\b", re.I)),
 ]
+# any other run of 4+ digits (ref, card, ZIP, phone piece); _num() keeps amounts, years and CPT codes
+NUM_RX = re.compile(r"(?<![\w$.,/*-])\d{4,}(?![\w*]|[.,/]\d)")
+AMOUNT_CTX = re.compile(r"(?:\$|amt|amount|paid|bal|balance|copay|coins\w*|deduct\w*|charged?|charges|pr|pa|aa|co)\W{0,3}$", re.I)
+CODE_CTX = re.compile(r"\b(?:cpt|hcpcs|proc\w*|codes?|e/?m|modifier|mod|svc|service line|line item)\b", re.I)
+
+
+def _num(m):
+    t, a, v = m.string, m.start(), m.group(0)
+    if AMOUNT_CTX.search(t[max(0, a - 10):a]) or re.fullmatch(r"(?:19|20)\d\d", v):
+        return v
+    # CPT: 5 digits in a sentence about codes, or listed next to another 5-digit code ("87798, 87481 and 87511")
+    sent = t[t.rfind(". ", 0, a) + 1:(t.find(". ", a) + 1) or len(t)]
+    if len(v) == 5 and (CODE_CTX.search(sent) or re.search(r"\b\d{5}\s*(?:,|and|&|/)\s*$", t[max(0, a - 12):a])
+                        or re.match(r"\s*(?:,|and|&|/)\s*\d{5}\b", t[m.end():m.end() + 12])):
+        return v
+    return token("NUM", v)
+
+
 # code-shaped tokens that must survive the ID rule
 KEEP = re.compile(r"^(?:(?:CPT|HCPCS|DX|ICD|CO|PR|OA|PI|MOD)[-:# ]*)?(?:\d{4}[0-9FTU]|[A-V]\d{4}|[A-Z]\d{2}(?:\.\w{1,4})?|\d{1,3}(?:\.\d+)?)$", re.I)
 
@@ -135,6 +157,22 @@ KEEP = re.compile(r"^(?:(?:CPT|HCPCS|DX|ICD|CO|PR|OA|PI|MOD)[-:# ]*)?(?:\d{4}[0-
 # notes ("[CLAIM NUMBER-12]", "MEMBER ID-3"); a one-word code like ICN-1234 is NOT a placeholder and still gets masked
 TOKEN_RX = re.compile(r"(\[(?:[A-Z]+-[0-9A-F]{6}|D[+-]\d+|DATE)\]|[A-Za-z0-9]*\*{2,}[A-Za-z0-9]*"
                       r"|\[[A-Z][A-Z ]{2,30}-\d{1,4}\]|\b[A-Z]{2,}(?: [A-Z]{2,}){1,3}-\d{1,3}\b)")
+
+
+DOB_CTX = re.compile(r"\b(?:dob|d\.o\.b\.?|date of birth|birth\s*date|birthdate|born(?: on)?|bday)\W{0,15}$", re.I)
+
+
+def mask_dob(text, worked):
+    """Dates stay as written, except a date of birth: labelled DOB / date of birth, or more than 10 years before the
+    worked date (no claim date goes back that far; a birth date does)."""
+    def repl(m):
+        if DOB_CTX.search(m.string[max(0, m.start() - 30):m.start()]):
+            return token("DOB", m.group(0))
+        y = int(m.group(3) or m.group(6))
+        if y < 100:
+            y += 2000 if y <= worked.year % 100 else 1900
+        return token("DOB", m.group(0)) if y < worked.year - 10 else m.group(0)
+    return DATE_RX.sub(repl, text)
 
 
 def shift_dates(text, worked):
@@ -158,12 +196,13 @@ def _mask_match(m, kind):
         a, b = m.span("v")
         g0 = m.start()
         return m.group(0)[: a - g0] + token(kind, m.group("v")) + m.group(0)[b - g0:]
-    return m.group(0) if KEEP.match(m.group(0)) else token(kind, m.group(0))
+    keep = KEEP.match(m.group(0)) or DATE_RX.fullmatch(m.group(0))  # 10-15-2025 is a work date (DOBs went earlier)
+    return m.group(0) if keep else token(kind, m.group(0))
 
 
 def scrub_note(text, worked):
     t = str(text)
-    t = shift_dates(t, worked)
+    t = mask_dob(t, worked)
     t = SUBSCRIBER_NAME.sub(lambda m: m.group(1) + token("NAME", m.group(2)), t)
     t = UPPER_NAME.sub(lambda m: m.group(0) if is_vocab(m.group(0)) else token("NAME", m.group(0)), t)
     t = NAME_TRIGGER.sub(lambda m: m.group(0) if is_vocab(m.group(2)) else f"{m.group(1)} {token('NAME', m.group(2))}", t)
@@ -172,6 +211,7 @@ def scrub_note(text, worked):
     for kind, rx in SUBS:
         parts = [p if i % 2 else rx.sub(lambda m, k=kind: _mask_match(m, k), p) for i, p in enumerate(parts)]
         parts = TOKEN_RX.split("".join(parts))
+    parts = [p if i % 2 else NUM_RX.sub(_num, p) for i, p in enumerate(parts)]
     return "".join(parts)
 
 
@@ -180,7 +220,6 @@ RESIDUAL = {
     "digits_6plus": re.compile(r"\d{6,}"),
     "phone_like": re.compile(r"\d{3}[\s.-]\d{3}[\s.-]\d{4}"),
     "name_after_trigger": re.compile(r"\b(s/w|spoke with|rep\.?)\s+([A-Z][a-z]{2,})\b"),
-    "calendar_date": re.compile(r"\b\d{1,2}/\d{1,2}(/\d{2,4})?\b"),
     "dob_ssn_word": re.compile(r"\b(dob|date of birth|ssn|social security)\b\W{0,6}\d", re.I),  # label + an unmasked number
 }
 

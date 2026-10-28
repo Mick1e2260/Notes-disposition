@@ -257,3 +257,18 @@ without its date plus a hash of the full header set, so next week's file is reco
   column_profiles.json.bak-2026-10-27-old-roles and header_memory.json.bak-2026-10-27-old-roles.
 - Real AR Audit file (23-Oct, 8 sheets, suggested tags): every sheet masked; Findings 1,349 of 1,351 rows kept (2 quarantined);
   notes median 5.3% of characters starred, 90th percentile 11%.
+
+
+### Warning when a No PHI column holds PHI (`phiscan.py`, 28-Oct-2026)
+A column tagged **No PHI** is checked with the masker's own rules: each value goes through `phi_scrub.scrub_note` (without changing
+anything) and the column is flagged if the masker would have masked something (names after "spoke with", phones, emails, SSNs,
+addresses, reference/long numbers, dates of birth). Because it calls the masker, it follows any change to the masking rules.
+- **Step 2 (before running):** a "⚠ N sensitive" badge on the header, a banner listing what was found with *Apply suggested tags* and
+  *Show only these*, a "Set to X" button in the column's detail, and an amber count in the footer. Uses the first 400 rows.
+- **Run:** *Start processing* asks for confirmation when flagged columns remain (Cancel goes back with only those columns shown).
+- **During the run:** every No PHI column is scanned across the full data (up to 3,000 distinct values per column; statuses and codes are
+  checked once per distinct value). Warnings go to the log (`WARNING: sheet | column | found | suggest`), to an amber box in Results,
+  and to a **PHI Warnings** sheet inside the masked workbook, so the flag travels with the file.
+- Output is counts and value shapes only (`999-999-9999`), never the values. A column's own words are not used to excuse it
+  (a column of names tagged No PHI is still flagged). The column is left unchanged: the warning never alters the masked output.
+- Suggested tag: sentences (avg 40+ characters) -> Text; short values with names/phones/emails/addresses/DOB -> PHI; numbers/IDs -> Identifier.

@@ -14,6 +14,7 @@ cd /d "%~dp0"
 rem Prefer the Python source (always current); fall back to the built exe.
 set "RUN="
 where python >nul 2>nul && set "RUN=python ar_audit.py"
+if not defined RUN if exist "%~dp0..\dist\AR-Audit\AR-Audit\AR-Audit.exe" set "RUN="%~dp0..\dist\AR-Audit\AR-Audit\AR-Audit.exe""
 if not defined RUN if exist "%~dp0..\dist\AR-Audit\AR-Audit.exe" set "RUN="%~dp0..\dist\AR-Audit\AR-Audit.exe""
 if not defined RUN (
     echo Python was not found and AR-Audit.exe is not built. Install Python 3.12 or build the exe.
