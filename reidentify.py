@@ -5,10 +5,10 @@ Every '... - REID KEY ....xlsx' in PRIVATE_DIR is used (the salt is stable, so k
   - Identifier tokens ([CLM-AB12CD]) come back exactly.
   - Starred values (PHI columns, and names/numbers inside Text) come back only when the mask is unambiguous:
     John and Joan both star to J**n, so J**n is left as it is rather than restored to the wrong person.
-  - Day offsets become dates again: 'X (days vs worked)' columns become 'X', and [D-34] in text becomes MM/DD/YYYY.
+  - Day offsets become dates again: 'X (days vs worked)' columns become 'X' (MM/DD/YYYY).
 
-What cannot come back: dropped columns, far-off dates masked as [DATE] (e.g. DOB, by design), rows that went to
-QUARANTINE, ambiguous starred values, and original date formats (dates return as MM/DD/YYYY).
+What cannot come back: dropped columns, rows that went to QUARANTINE, ambiguous starred values, and original
+date formats (dates return as MM/DD/YYYY).
 The restored workbook contains PHI. It is built in memory and handed straight to the person who needs it; never stored.
 """
 import io
@@ -20,7 +20,6 @@ import pandas as pd
 import daily_mask as dm
 
 TOKEN = re.compile(r"\[[A-Z]+-[0-9A-F]{6}\]")
-DOFF = re.compile(r"\[D([+-]\d+)\]")
 DAYS_SUFFIX = " (days vs worked)"
 
 
@@ -53,10 +52,6 @@ def restore_bytes(raw, anchor):
         stats["restored"] += 1
         return exact[m.group(1)]
 
-    def sub_off(m):
-        stats["dates"] += 1
-        return (anchor + timedelta(days=int(m.group(1)))).strftime("%m/%d/%Y")
-
     def text(v):
         if not isinstance(v, str):
             return v
@@ -65,7 +60,7 @@ def restore_bytes(raw, anchor):
             stats["ambiguous"] += len(amb_rx.findall(v))
         if star_rx is not None:
             v = star_rx.sub(sub_star, v)
-        return DOFF.sub(sub_off, v)
+        return v
 
     xl = pd.ExcelFile(io.BytesIO(raw))
     buf = io.BytesIO()

@@ -11,7 +11,6 @@ Column roles and the first-pass guess from a header name (pure logic, no GUI).
 import re
 
 ROLES = ["No PHI", "PHI", "Identifier", "Date", "Text", "Drop"]
-LEGACY = {"Not PHI": "No PHI", "Free text": "Text"}  # role names saved by earlier versions
 
 KIND_GUESS = [("mrn|chart", "MRN"), (r"patient|\bpt\b|responsible|insured|subscriber|guarantor|^name|\bname$", "PAT"),
               ("claim", "CLM"), ("bill", "BIL"), ("account|acct", "ACC"),
@@ -33,10 +32,6 @@ PHI_HINT = (r"patient|\bpt\b|\bname\b|names?$|responsible|guarantor|insured|subs
 ID_HINT = (r"mrn|chart|claim|bill|\bacct\b|account|member|policy|group #|encounter|visit (id|no|#)|"
            r"auth(orization)? ?(no|#|number)|\bicn\b|\bdcn\b|\bnpi\b|\bref(erence)? ?(no|#|number)|"
            r"assigned user|submitted by|worked by|provider|pro name|physician|doctor|\bid$|\bid\b|unique|\bagent\b|emp")
-
-
-def norm_role(r):
-    return LEGACY.get(r, r)
 
 
 def guess_role(col):

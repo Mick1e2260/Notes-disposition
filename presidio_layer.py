@@ -1,10 +1,7 @@
 """
 Presidio + NER layer (second detection pass after phi_scrub's regex rules). Fully local.
 
-NER engines (env AR_AUDIT_NER):
-  spacy  (default)  spaCy model from AR_AUDIT_SPACY (default en_core_web_sm; en_core_web_lg is more accurate)
-  hf                transformer de-identification NER (AR_AUDIT_HF_MODEL, default StanfordAIMI/stanford-deidentifier-base)
-                    run through Presidio's TransformersNlpEngine; first use downloads the model once, then offline.
+NER: spaCy model from env AR_AUDIT_SPACY (default en_core_web_sm; en_core_web_lg is more accurate).
 
 Custom pattern recognizers cover the AR identifiers Presidio lacks (MRN, claim #, bill ID, account #, member ID, auth #).
 Existing tokens like [NAME-AB12CD] are never rescanned.
@@ -20,10 +17,6 @@ import phi_scrub as ps
 ENTITIES = ["PERSON", "PHONE_NUMBER", "EMAIL_ADDRESS", "US_SSN", "US_DRIVER_LICENSE", "US_BANK_NUMBER",
             "MEDICAL_LICENSE", "IP_ADDRESS", "URL", "MRN", "AR_ID"]
 MIN_SCORE = {"PERSON": 0.6}  # others: 0.4
-# entity labels a clinical de-id transformer emits -> Presidio entity names
-HF_MAP = {"PATIENT": "PERSON", "STAFF": "PERSON", "HCW": "PERSON", "PER": "PERSON", "PERSON": "PERSON",
-          "PHONE": "PHONE_NUMBER", "ID": "AR_ID", "EMAIL": "EMAIL_ADDRESS", "VENDOR": "O", "HOSPITAL": "O",
-          "DATE": "O", "AGE": "O", "LOC": "O", "LOCATION": "O", "PATORG": "O", "HOSP": "O", "ORGANIZATION": "O"}
 TOKEN_RX = ps.TOKEN_RX
 # payer / org / RCM words that NER mislabels as people; extended from the sheet's Payer/Client columns via allow()
 ALLOW = {w.lower() for w in (
@@ -44,15 +37,6 @@ _engine = None
 
 
 def _nlp_config():
-    if os.environ.get("AR_AUDIT_NER", "spacy") == "hf":
-        model = os.environ.get("AR_AUDIT_HF_MODEL", "StanfordAIMI/stanford-deidentifier-base")
-        return {"nlp_engine_name": "transformers",
-                "models": [{"lang_code": "en", "model_name": {"spacy": "en_core_web_sm", "transformers": model}}],
-                "ner_model_configuration": {
-                    "model_to_presidio_entity_mapping": HF_MAP,
-                    "labels_to_ignore": ["O"], "aggregation_strategy": "simple",
-                    "stride": 16, "alignment_mode": "expand", "low_confidence_score_multiplier": 0.4,
-                    "low_score_entity_names": ["ID"]}}
     return {"nlp_engine_name": "spacy",
             "models": [{"lang_code": "en", "model_name": os.environ.get("AR_AUDIT_SPACY", "en_core_web_sm")}]}
 

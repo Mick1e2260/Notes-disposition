@@ -3,7 +3,6 @@
 Reads no workbook data. Paste the output if something is still wrong.
 """
 import importlib
-import os
 import socket
 import sys
 import urllib.request
@@ -27,17 +26,17 @@ def main():
     frozen = getattr(sys, "frozen", False)
     print(f"AR Audit doctor | {'exe' if frozen else 'python ' + sys.version.split()[0]} | {sys.executable}\n")
 
-    for mod in ("pandas", "openpyxl", "presidio_analyzer", "presidio_anonymizer", "spacy"):
+    for mod in ("pandas", "openpyxl", "presidio_analyzer", "spacy"):
         check(f"library {mod}", lambda m=mod: (bool(importlib.import_module(m)), ""))
     check("spaCy model en_core_web_sm", lambda: (bool(__import__("spacy").load("en_core_web_sm")), ""))
 
     def ollama():
-        models = webui.gui.ollama_models()
+        models = webui.ollama_models()
         return (bool(models), f"models: {', '.join(models)}" if models else
                 "Ollama is not answering on 127.0.0.1:11434. Start it (Start menu > Ollama) or run: ollama serve")
     check("Ollama server", ollama)
     def model():
-        ok = "qwen2.5:7b-instruct" in webui.gui.ollama_models()
+        ok = "qwen2.5:7b-instruct" in webui.ollama_models()
         return ok, "" if ok else "missing: run  ollama pull qwen2.5:7b-instruct"
     check("model qwen2.5:7b-instruct", model)
 

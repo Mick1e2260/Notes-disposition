@@ -83,7 +83,13 @@ def main():
     src = pick_input(a.masked)
     if "MASKED" not in src.name:
         raise SystemExit("Refusing: input must be the '- MASKED' file produced by daily_mask.py")
-    df = pd.read_excel(src)
+    # the masked workbook holds every sheet of the audit result; the review needs the line-level findings sheet
+    xl = pd.ExcelFile(src)
+    need = {"#", "Code", NOTES}
+    sheet = next((n for n in xl.sheet_names if need <= set(pd.read_excel(xl, n, nrows=0).columns)), None)
+    if sheet is None:
+        raise SystemExit(f"No sheet in {src.name} has the columns {sorted(need)} (the audit's line-level findings).")
+    df = pd.read_excel(xl, sheet)
 
     # one row per claim: its codes, fatal flag, and the fields the model needs
     g = df.groupby("#")

@@ -1,44 +1,24 @@
 """
-PHI scrub for the AR work dump (HIPAA Safe Harbor style), run BEFORE any note
-leaves this machine.
+The masking rules for free text (HIPAA Safe Harbor style), used by daily_mask.py before anything reaches an LLM.
 
-Usage:  python phi_scrub.py "<workbook.xlsx>" [out_dir]
+Masked: person names (rep, subscriber, patient), phone/fax, email, URL, SSN, street / PO Box addresses and ZIPs,
+every long ID (claim #, ICN, member ID, auth #, call ref, EFT/check #, case #, batch #, card #), any other run of
+4+ digits, and dates of birth (labelled DOB, or too far back to be a work date).
+Kept (not identifiers under Safe Harbor, and needed for the audit): work dates as written (DOS, billed/denied on ...),
+CPT/HCPCS, ICD-10, modifiers, CARC/RARC, $ amounts, years, small counts (TFL 180 days), payer names, TAT/TFL wording.
 
-Outputs (in out_dir, default = next to the workbook):
-  <name> - SCRUBBED.xlsx    safe payload: token IDs, scrubbed notes, relative dates
-  <name> - QUARANTINE.xlsx  rows whose scrubbed note still looks risky (never send these)
-  <name> - REID KEY.xlsx    token -> original value. Stays local, restricted access.
-
-What is removed / replaced in notes:
-  person names (rep, subscriber, patient), phone/fax, email, URL, SSN,
-  street / PO Box addresses and ZIPs, every long ID (claim #, ICN, member ID,
-  auth #, call ref, EFT/check #, case #, batch #, card #), any other run of 4+ digits,
-  dates of birth (labelled DOB, or too far back to be a work date).
-What is kept (not identifiers under Safe Harbor, and needed for the audit):
-  work dates as written (DOS, billed/denied on ...), CPT/HCPCS, ICD-10, modifiers, CARC/RARC,
-  $ amounts, years, small counts (TFL 180 days), payer names, TAT/TFL wording.
-
-This lowers risk; it does not make data "de-identified" on its own say-so.
-Have compliance sign off on the method and on a reviewed sample before using
-any cloud service without a BAA.
+This lowers risk; it does not make data "de-identified" on its own say-so. Have compliance sign off on the method and
+on a reviewed sample before using any cloud service without a BAA.
 """
 import hashlib
-import os
 import re
-import sys
-from datetime import datetime
-from pathlib import Path
-
-import pandas as pd
 
 NOTES = "Notes (PHI Safe"
-# Private salt, same salt -> stable tokens across days. Never hardcode: set env AR_AUDIT_SALT
-# (daily_mask.py generates and stores one outside the repo on first run).
-SALT = os.environ.get("AR_AUDIT_SALT", "CHANGE-ME")
+# Private salt: same salt -> stable tokens across days. daily_mask.private_setup() generates it and keeps it outside the repo.
+SALT = ""
 
 # Columns that carry identifiers and are not needed by an AI reviewer
 DROP_COLS = ["Representative Name", "Call Reference #", "Portal Reference #", "Insurance Phone"]
-TOKEN_COLS = ["Unique ID"]
 DATE_COLS = ["DOS", "Billed Date", "Due Date", "Denial Date"]
 
 STYLE = "star"  # text + PHI columns: J**n, 1*****9 (keeps the sentence); Identifier columns use "token"
@@ -155,7 +135,7 @@ KEEP = re.compile(r"^(?:(?:CPT|HCPCS|DX|ICD|CO|PR|OA|PI|MOD)[-:# ]*)?(?:\d{4}[0-
 
 # already masked, never re-scanned: our tokens, starred values, and placeholders the source system already put in the
 # notes ("[CLAIM NUMBER-12]", "MEMBER ID-3"); a one-word code like ICN-1234 is NOT a placeholder and still gets masked
-TOKEN_RX = re.compile(r"(\[(?:[A-Z]+-[0-9A-F]{6}|D[+-]\d+|DATE)\]|[A-Za-z0-9]*\*{2,}[A-Za-z0-9]*"
+TOKEN_RX = re.compile(r"(\[[A-Z]+-[0-9A-F]{6}\]|[A-Za-z0-9]*\*{2,}[A-Za-z0-9]*"
                       r"|\[[A-Z][A-Z ]{2,30}-\d{1,4}\]|\b[A-Z]{2,}(?: [A-Z]{2,}){1,3}-\d{1,3}\b)")
 
 
@@ -172,21 +152,6 @@ def mask_dob(text, worked):
         if y < 100:
             y += 2000 if y <= worked.year % 100 else 1900
         return token("DOB", m.group(0)) if y < worked.year - 10 else m.group(0)
-    return DATE_RX.sub(repl, text)
-
-
-def shift_dates(text, worked):
-    def repl(m):
-        try:
-            if m.group(1):
-                y = int(m.group(3)); y = y + 2000 if y < 100 else y
-                d = datetime(y, int(m.group(1)), int(m.group(2)))
-            else:
-                d = datetime.strptime(f"{m.group(4)[:3]} {m.group(5)} {m.group(6)}", "%b %d %Y")
-        except ValueError:
-            return "[DATE]"
-        days = (d - worked).days
-        return f"[D{days:+d}]" if abs(days) <= 1100 else "[DATE]"  # far-off dates (DOB etc.) would reveal age
     return DATE_RX.sub(repl, text)
 
 
@@ -231,35 +196,3 @@ def residual(t):
             return any(not is_vocab(m.group(2)) for m in rx.finditer(t))
         return bool(rx.search(t))
     return ", ".join(k for k, rx in RESIDUAL.items() if hit(k, rx))
-
-
-def main():
-    SRC = Path(sys.argv[1])
-    OUT_DIR = Path(sys.argv[2]) if len(sys.argv) > 2 else SRC.parent
-    df = pd.read_excel(SRC, sheet_name=0)
-    out = df.drop(columns=[c for c in DROP_COLS if c in df.columns]).copy()
-    worked = pd.to_datetime(df["Worked Date"])
-    for c in TOKEN_COLS:
-        out[c] = df[c].map(lambda v: token("CLM", v))
-    for c in DATE_COLS:
-        if c in df.columns:
-            out[c] = (pd.to_datetime(df[c], errors="coerce") - worked.dt.normalize()).dt.days
-            out = out.rename(columns={c: f"{c} (days vs worked)"})
-    out[NOTES] = [scrub_note(n, w) for n, w in zip(df[NOTES], worked)]
-    out["Residual Risk"] = out[NOTES].map(residual)
-
-    safe = out[out["Residual Risk"] == ""].drop(columns="Residual Risk")
-    quar = out[out["Residual Risk"] != ""]
-    key = pd.DataFrame(key_rows, columns=["Token", "Type", "Original"]).drop_duplicates("Token")
-
-    stem = SRC.stem
-    safe.to_excel(OUT_DIR / f"{stem} - SCRUBBED.xlsx", index=False)
-    quar.to_excel(OUT_DIR / f"{stem} - QUARANTINE.xlsx", index=False)
-    key.to_excel(OUT_DIR / f"{stem} - REID KEY.xlsx", index=False)
-    print(f"rows {len(df)} | safe {len(safe)} | quarantined {len(quar)} | tokens {len(key)}")
-    print(key["Type"].value_counts().to_string())
-    print(quar["Residual Risk"].str.split(", ").explode().value_counts().to_string())
-
-
-if __name__ == "__main__":
-    main()

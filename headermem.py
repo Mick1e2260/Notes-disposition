@@ -8,13 +8,15 @@ Stored in header_memory.json (headers, roles and token kinds only, never cell da
 Headers are matched after normalising ('Patient  Name', 'patient_name' and 'PATIENT NAME' are one header).
 """
 import json
+import os
 import re
 from datetime import datetime
 from pathlib import Path
 
-from mask_columns_logic import norm_role
-
-FILE = Path(__file__).with_name("header_memory.json")  # ar_audit.py points this next to the exe when frozen
+# Saved tags and header memory live here (headers and roles only, no data), the same for the exe and for python,
+# so rebuilding the exe never touches them.
+CONFIG_DIR = Path(os.environ.get("AR_AUDIT_CONFIG_DIR") or Path(os.environ["LOCALAPPDATA"]) / "AnkaARAudit" / "config")
+FILE = CONFIG_DIR / "header_memory.json"
 COVERAGE = 0.7  # share of a sheet's headers that must be remembered before a headless run trusts the memory
 _cache = {"mtime": None, "data": {}}
 
@@ -25,32 +27,15 @@ def norm(h):
 
 def _data():
     if not FILE.exists():
-        _cache.update(mtime=None, data=_seed())
-        return _cache["data"]
+        return {}
     m = FILE.stat().st_mtime
     if _cache["mtime"] != m:
         _cache.update(mtime=m, data=json.loads(FILE.read_text(encoding="utf-8")).get("headers", {}))
     return _cache["data"]
 
 
-def _seed():
-    """First use: learn from any column profiles saved before header memory existed (marked columns only)."""
-    pf = FILE.with_name("column_profiles.json")
-    out = {}
-    if pf.exists():
-        for p in json.loads(pf.read_text(encoding="utf-8")).get("profiles", []):
-            for role, cols in (("Date", p.get("dates", [])), ("Text", p.get("text", [])),
-                               ("PHI", p.get("phi", [])), ("Drop", p.get("drop", []))):
-                for c in cols:
-                    out[norm(c)] = {"name": c, "role": role, "seen": 1}
-            for c, k in p.get("tokens", {}).items():
-                out[norm(c)] = {"name": c, "role": "Identifier", "kind": k, "seen": 1}
-    return out
-
-
 def lookup(col):
-    e = _data().get(norm(col))
-    return {**e, "role": norm_role(e["role"])} if e else None
+    return _data().get(norm(col))
 
 
 def remember(roles, kind_for=None):
@@ -60,6 +45,7 @@ def remember(roles, kind_for=None):
         e = d.get(norm(c), {})
         d[norm(c)] = {"name": str(c), "role": r, "seen": e.get("seen", 0) + 1, "last": datetime.now().strftime("%Y-%m-%d"),
                       **({"kind": (kind_for(c) if kind_for else e.get("kind", "ID"))} if r == "Identifier" else {})}
+    FILE.parent.mkdir(parents=True, exist_ok=True)
     FILE.write_text(json.dumps({"headers": d}, indent=1), encoding="utf-8")
     _cache["mtime"] = None
     return len(d)

@@ -1,17 +1,14 @@
 """
 Single entry point (also what the .exe runs).
 
+  ar_audit ui [--network]     browser UI (default with no command); --network serves it on this PC's LAN address with a secret key
   ar_audit daily              mask the newest 'AR Audit Result*.xlsx' in OneDrive, then local-Qwen review
-  ar_audit mark [file]        open the window to mark which columns hold PHI
-  ar_audit mask [file ...]    mask workbook(s)          (extra flags: --date, --no-presidio)
+  ar_audit mask [file ...]    mask workbook(s)          (flags: --date, --no-presidio, --suggest)
   ar_audit review [masked]    note-vs-disposition LLM review of a masked audit-result workbook
   ar_audit classify [masked]  LLM classification of a masked Open AR inventory workbook
-  ui [--network]              browser UI (default with no command). --network serves it on this PC's LAN address with a secret key
-  classic                     the older plain desktop window (Tk)
-  doctor                      check Python/libraries/Ollama/model/folders/port/network and print what is wrong
-  help                        prints this help
+  ar_audit doctor             check Python/libraries/Ollama/model/folders/port/network and print what is wrong
 
-Next to the exe, keep llm_context.md (editable brief for the model) and column_profiles.json (your saved column marks).
+Next to the exe, keep llm_context.md (the editable brief for the model).
 """
 import subprocess
 import sys
@@ -44,29 +41,12 @@ def run(mod_main, argv):
 def main():
     cmd, rest = (sys.argv[1], sys.argv[2:]) if len(sys.argv) > 1 else ("ui", [])
     import daily_mask as dm
-    cfg = Path(os.environ.get("AR_AUDIT_CONFIG_DIR") or BASE)  # saved configs + header memory (headers only)
-    dm.PROFILE_FILE = cfg / "column_profiles.json"
-    import headermem
-    headermem.FILE = cfg / "header_memory.json"
     if cmd == "ui":
         import webui
         webui.main(network="--network" in rest)
-    elif cmd in ("classic", "gui"):
-        import gui
-        gui.main()
     elif cmd == "doctor":
         import doctor
         doctor.main()
-    elif cmd == "pick":  # native file dialog, used by the browser UI's Browse button
-        import tkinter as tk
-        from tkinter import filedialog
-        r = tk.Tk()
-        r.withdraw()
-        r.attributes("-topmost", True)
-        print(filedialog.askopenfilename(initialdir=dm.SOURCE_DIR, filetypes=[("Excel", "*.xlsx *.xlsm")]))
-    elif cmd == "mark":
-        import mask_columns as mc
-        mc.App(rest[0] if rest else None).mainloop()
     elif cmd == "mask":
         run(dm.main, rest)
     elif cmd in ("review", "daily", "classify"):

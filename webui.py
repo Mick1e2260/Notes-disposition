@@ -3,7 +3,7 @@ Local web UI (default). Serves one page on 127.0.0.1 only and opens it in your b
 requests: the page and API live in this process. Every API call needs a per-run token and a loopback Host header.
 
 Flow: 1 pick workbook  ->  2 mark which column headers hold PHI (saved per report type)  ->  3 run mask (+ local review).
-Steps run as child processes of this program (see gui.self_cmd), so masking must succeed before any LLM step starts.
+Steps run as child processes of this program (see self_cmd), so masking must succeed before any LLM step starts.
 Only headers are ever read for the page; the log shows counts, never cell data.
 """
 import contextlib
@@ -15,7 +15,9 @@ import re
 import secrets
 import socket
 import subprocess
+import sys
 import threading
+import urllib.request
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -25,9 +27,7 @@ from urllib.parse import parse_qs, quote, urlparse
 import pandas as pd
 
 import daily_mask as dm
-import gui
 import headermem as hm
-import mask_columns as mc
 import mask_columns_logic as ml
 import phiscan
 import phi_scrub as ps
@@ -38,7 +38,22 @@ ALLOWED_HOSTS = {"127.0.0.1", "localhost"}
 SERVER_IP = {"ip": None}  # this PC's LAN address when running in network mode
 JOB = {"lines": [], "done": True, "ok": True, "running": False}
 LOCK = threading.Lock()
-ROLES = mc.ROLES
+ROLES = ml.ROLES
+FROZEN = getattr(sys, "frozen", False)
+DEFAULT_MODEL = "qwen2.5:7b-instruct"
+
+
+def self_cmd(*args):
+    """Command line that runs this same program (the exe, or python) with `args`: used for the masking and review steps."""
+    return ([sys.executable] if FROZEN else [sys.executable, str(Path(__file__).with_name("ar_audit.py"))]) + list(args)
+
+
+def ollama_models():
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:11434/api/tags", timeout=2) as r:
+            return [m["name"] for m in json.loads(r.read())["models"]]
+    except Exception:
+        return []
 
 
 def say(s):
@@ -96,12 +111,12 @@ def col_stats(s, anchor=None, vocab=None):
     """Facts about a column that do not reveal its values: fill, distinct, type, what the masking rules find, value shapes."""
     nn = s.dropna()
     txt = nn.astype(str)
-    out = {"rows": int(len(s)), "filled": round(len(nn) / max(len(s), 1) * 100), "distinct": int(nn.nunique()),
+    out = {"filled": round(len(nn) / max(len(s), 1) * 100), "distinct": int(nn.nunique()),
            "type": "date" if pd.api.types.is_datetime64_any_dtype(s) else "number" if pd.api.types.is_numeric_dtype(s) else "text",
            "avg_len": int(txt.str.len().mean()) if len(txt) else 0}
     # same rules the masker uses: would it have masked anything in this column?
     sc = phiscan.scan_series(s, anchor or datetime.now(), vocab)
-    out["hits"], out["hit_shapes"], out["suggest"], out["scanned"] = sc["hits"], sc["shapes"], sc["suggest"], sc["cells"]
+    out["hits"], out["suggest"], out["scanned"] = sc["hits"], sc["suggest"], sc["cells"]
     out["shapes"] = [[k, int(v)] for k, v in txt.map(shape).value_counts().head(3).items()] if out["type"] != "number" else []
     return out
 
@@ -109,7 +124,7 @@ def col_stats(s, anchor=None, vocab=None):
 def columns_of(path, sheet):
     df = frame(path, sheet)
     cols = [str(c) for c in df.columns]
-    roles, src = hm.role_map(cols, lambda c: ml.guess_role_data(c, df[c]), mc.guess_kind)
+    roles, src = hm.role_map(cols, lambda c: ml.guess_role_data(c, df[c]), ml.guess_kind)
     prof = dm.detect_profile(cols)
     cand = dm.vocab_candidates(df, {k: [c for c, r in roles.items() if r == role] for k, role in
                                     (("tokens", "Identifier"), ("dates", "Date"), ("text", "Text"), ("phi", "PHI"), ("drop", "Drop"))})
@@ -133,7 +148,7 @@ def preview(path, sheet, col, role):
             if role == "PHI":
                 out.append(ps.star(v))
             elif role == "Identifier":
-                out.append(ps.token(hm.kind_for(col, mc.guess_kind), v, "token"))
+                out.append(ps.token(hm.kind_for(col, ml.guess_kind), v, "token"))
             elif role == "Date":
                 d = pd.to_datetime(v, errors="coerce")
                 out.append("unreadable date" if pd.isna(d) else f"{(d - pd.Timestamp(anchor)).days:+d} days from work date")
@@ -199,14 +214,14 @@ def _run_job(opts):
         say(f"Could not read the workbook: {e}")
         JOB.update(done=True, ok=False, running=False)
         return
-    steps = [None if mem else gui.self_cmd("mask", str(p), "--suggest", *([] if opts.get("presidio", True) else ["--no-presidio"]))]
+    steps = [None if mem else self_cmd("mask", str(p), "--suggest", *([] if opts.get("presidio", True) else ["--no-presidio"]))]
     if mode != "mask":
-        extra = ["--model", opts.get("model") or gui.DEFAULT_MODEL]
+        extra = ["--model", opts.get("model") or DEFAULT_MODEL]
         if int(opts.get("limit") or 0) > 0:
             extra += ["--limit", str(int(opts["limit"]))]
         if mode == "classify":
             extra.append("--all")
-        steps.append(gui.self_cmd(mode, *extra))
+        steps.append(self_cmd(mode, *extra))
     ok = True
     for i, cmd in enumerate(steps, 1):
         name = "mask" if cmd is None else next(c for c in cmd if c in ("mask", "review", "classify"))
@@ -287,7 +302,9 @@ class H(BaseHTTPRequestHandler):
             return self._send(403, {"error": "bad host"})
         if u.path == "/":
             if parse_qs(u.query).get("k", [""])[0] != TOKEN:
-                return self._send(403, b"<h3>Open the link printed by the launcher (it ends with ?k=...).</h3>", "text/html")
+                return self._send(403, b"<h3>This is AR Audit, but the key in this link does not match.</h3><p>Use the link printed in the window "
+                                      b"that started AR Audit (it ends with ?k=...). If AR Audit was started more than once, close the "
+                                      b"other windows first.</p>", "text/html")
             return self._send(200, PAGE.replace("__TOKEN__", TOKEN).encode(), "text/html")
         if self.headers.get("X-Token") != TOKEN:
             return self._send(403, {"error": "bad token"})
@@ -295,9 +312,9 @@ class H(BaseHTTPRequestHandler):
         try:
             if u.path == "/api/state":
                 files = dm.newest_sources()
-                models = gui.ollama_models()
+                models = ollama_models()
                 return self._send(200, {"path": str(files[0]) if files else "", "models": models,
-                                        "model": gui.DEFAULT_MODEL if (not models or gui.DEFAULT_MODEL in models) else models[0],
+                                        "model": DEFAULT_MODEL if (not models or DEFAULT_MODEL in models) else models[0],
                                         "ollama": bool(models), "out": str(dm.MASKED_DIR), "roles": ROLES})
             if u.path == "/api/sheets":
                 return self._send(200, {"sheets": sheets_of(q["path"])})
@@ -350,14 +367,11 @@ class H(BaseHTTPRequestHandler):
                                   {"X-Restored": st["restored"], "X-Unresolved": st["unresolved"],
                                    "X-Dates": st["dates"], "X-Ambiguous": st["ambiguous"]})
             body = json.loads(raw or b"{}")
-            if u == "/api/browse":
-                r = subprocess.run(gui.self_cmd("pick"), capture_output=True, text=True, creationflags=0x08000000)
-                return self._send(200, {"path": r.stdout.strip()})
             if u == "/api/profile":
                 roles = body["roles"]
-                name = mc.config_name(name_of(body["path"]), list(roles))  # one config per header set
-                mc.remember(roles)  # header memory: next sheet pre-fills these decisions
-                mc.save_profile(mc.profile_from_roles(name, roles))
+                name = dm.config_name(name_of(body["path"]), list(roles))  # one config per header set
+                hm.remember(roles, lambda c: hm.kind_for(c, ml.guess_kind))  # header memory: next sheet pre-fills these decisions
+                dm.save_profile(dm.profile_from_roles(name, roles))
                 return self._send(200, {"saved": sum(r != "No PHI" for r in roles.values()), "of": len(roles), "config": name})
             if u == "/api/run":
                 with LOCK:
@@ -399,20 +413,34 @@ def persistent_key():
     return f.read_text().strip()
 
 
+class Server(ThreadingHTTPServer):
+    allow_reuse_address = False
+
+    def server_bind(self):
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):  # Windows: never share the port with another copy of AR Audit
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
+def open_server(host, port=8765):
+    """The first free port from `port` up (so the link is stable when nothing else uses it)."""
+    for pt in list(range(port, port + 10)) + [0]:
+        try:
+            return Server((host, pt), H)
+        except OSError:
+            continue
+
+
 def main(network=False, port=8765):
     global TOKEN
     TOKEN = persistent_key()
     host, ip = ("0.0.0.0", lan_ip()) if network else ("127.0.0.1", None)
     ALLOWED_HOSTS.update({ip, socket.gethostname().lower(), socket.getfqdn().lower()} - {None})
     SERVER_IP["ip"] = ip
-    srv = None
-    for pt in list(range(port, port + 10)) + [0]:  # stable port when free, else the next one
-        try:
-            srv = ThreadingHTTPServer((host, pt), H)
-            break
-        except OSError:
-            continue
+    srv = open_server(host, port)
     pt = srv.server_address[1]
+    if pt != port:
+        print(f"  Port {port} is already in use by another program (probably another AR Audit window), so port {pt} is used.", flush=True)
     local = f"http://127.0.0.1:{pt}/?k={TOKEN}"
     print("AR Audit is running. Close this window or press Quit in the page to stop.", flush=True)
     if network:
@@ -485,9 +513,6 @@ label.chk{display:inline-flex;gap:8px;align-items:center;cursor:pointer}
 input[type=number]{width:92px}
 #log{background:var(--log-bg);color:var(--log-ink);font:12.5px/1.6 var(--mono);border-radius:10px;padding:14px 16px;min-height:150px;max-height:320px;overflow:auto;white-space:pre-wrap;margin-top:16px}
 #log:empty::before{content:"Output appears here. Counts only, never cell data.";opacity:.55}
-.bar{height:3px;background:var(--line);border-radius:2px;overflow:hidden;margin-top:16px;opacity:0;transition:opacity .3s var(--ease)}
-.bar.on{opacity:1}.bar b{display:block;height:100%;width:35%;background:var(--accent);animation:slide 1.3s var(--ease) infinite}
-@keyframes slide{from{transform:translateX(-100%)}to{transform:translateX(290%)}}
 .state{font:600 13px var(--display);letter-spacing:.04em}
 .state.ok{color:var(--good)}.state.fail{color:var(--bad)}
 .err{color:var(--bad);font-size:13.5px;margin-top:8px}
@@ -512,7 +537,6 @@ code{font:12.5px var(--mono)}.pv{display:grid;gap:5px;margin-top:6px}
 .pv code{background:var(--log-bg);color:var(--log-ink);padding:6px 10px;border-radius:6px;white-space:pre-wrap;word-break:break-word}
 .drop{margin-top:12px;padding:16px;border:1.5px dashed var(--line);border-radius:10px;color:var(--muted);font-size:13.5px;cursor:pointer;transition:border-color .2s var(--ease),background .2s var(--ease)}
 .drop:hover,.drop.over,.drop:focus-visible{border-color:var(--accent);background:var(--accent-soft);outline:none}.drop u{color:var(--accent)}
-.rh{font:600 12px var(--display);letter-spacing:.07em;text-transform:uppercase;color:var(--muted);margin:24px 0 6px}
 .frow{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:9px 0;border-bottom:1px solid var(--line)}
 .fn{display:grid;min-width:0}.fn b{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}.fn small{color:var(--muted);font-size:12.5px}
 input[type=date]{min-height:40px}
@@ -610,7 +634,7 @@ section.panel h2{font-size:27px;margin-bottom:8px} section.panel .hint{font-size
   <p class="muted" id="rnote" style="margin-top:10px"></p>
 </div></section>
 </main>
-<div class="loading" id="loading" role="status" aria-live="polite"><div class="loading-card"><div class="spinner" aria-hidden="true"></div><h2>Processing your workbook</h2><p id="loadingText">Masking sensitive information. This may take a few minutes.</p><p>Please keep this window open.</p></div></div>
+<div class="loading" id="loading" role="status" aria-live="polite"><div class="loading-card"><div class="spinner" aria-hidden="true"></div><h2>Processing your workbook</h2><p>Masking sensitive information. This may take a few minutes.</p><p>Please keep this window open.</p></div></div>
 <script>
 const T="__TOKEN__",$=id=>document.getElementById(id);
 const api=(p,o={})=>fetch(p,{...o,headers:{"X-Token":T,"Content-Type":"application/json"}}).then(r=>r.json());

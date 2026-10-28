@@ -18,6 +18,7 @@ Guarantees
 Pattern + NER masking is not proof of de-identification: compliance has to approve the method.
 """
 import argparse
+import hashlib
 import io
 import json
 import os
@@ -30,6 +31,7 @@ from pathlib import Path
 import pandas as pd
 
 import headermem as hm
+import mask_columns_logic as ml
 import phi_scrub as ps
 import phiscan
 
@@ -57,7 +59,7 @@ PROFILES = {
         tokens={"Unique ID": "CLM", "Agent": "AGT", "Emp ID": "EMP"},
         dates=ps.DATE_COLS, text=[ps.NOTES]),
 }
-PROFILE_FILE = Path(__file__).with_name("column_profiles.json")  # written by mask_columns.py (headers + roles only, no data)
+PROFILE_FILE = hm.CONFIG_DIR / "column_profiles.json"  # one saved config per file type (headers + roles only, no data)
 ALLOW_COLS = ["Payer", "Payer Name", "Insurance Group", "Client", "Client Name", "Location", "Facility"]  # not PHI: never masked as people
 SKIP_KINDS = {"NUM", "CLM", "AGT", "EMP", "BIL", "ACC", "USR", "PRV", "MRN", "PAT", "PHI"}  # column values: not swept as text
 NAME_KINDS = {"PAT", "PHI"}  # ...except names, which are also masked wherever they appear inside a sentence
@@ -107,8 +109,33 @@ def saved_profiles():
     return {}
 
 
+def config_name(filename, cols):
+    """One config per header set: 'AR Audit Result 2026-10-23.xlsx' and next week's file share a name."""
+    label = re.sub(r"[\s_-]*\(?\d[\d\s()_-]*\)?(?:\(old\))?$", "", Path(str(filename)).stem, flags=re.I)
+    label = re.sub(r"\d{4}-\d{2}-\d{2}", "", label).strip(" _-") or "Sheet"
+    sig = hashlib.sha1("|".join(sorted(hm.norm(c) for c in cols)).encode()).hexdigest()[:6]
+    return re.sub(r"\W+", "_", label)[:30] + "_" + sig
+
+
+def profile_from_roles(name, roles):
+    """The whole header set identifies the report type, so each of your file types keeps its own config."""
+    return {"name": name, "match": list(roles),
+            "phi": [c for c, r in roles.items() if r == "PHI"],
+            "tokens": {c: hm.kind_for(c, ml.guess_kind) for c, r in roles.items() if r == "Identifier"},
+            "dates": [c for c, r in roles.items() if r == "Date"],
+            "text": [c for c, r in roles.items() if r == "Text"],
+            "drop": [c for c, r in roles.items() if r == "Drop"]}
+
+
+def save_profile(profile):
+    data = json.loads(PROFILE_FILE.read_text(encoding="utf-8")) if PROFILE_FILE.exists() else {"profiles": []}
+    data["profiles"] = [p for p in data["profiles"] if p["name"] != profile["name"]] + [profile]
+    PROFILE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    PROFILE_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
 def detect_profile(cols):
-    """A profile you marked in mask_columns.py wins; otherwise the built-in sheet types."""
+    """A config you saved wins; otherwise the built-in sheet types."""
     allp = {**saved_profiles(), **PROFILES}
     fits = [(len(p["detect"]), name) for name, p in allp.items() if p["detect"] <= set(cols)]
     if fits:
@@ -128,9 +155,8 @@ def builtin_profile(cols):
 
 def suggested(cols, df=None):
     """Header memory first, then a guess from the header name and (when given) the values."""
-    import mask_columns_logic as mcl
-    guess = (lambda c: mcl.guess_role_data(c, df[c])) if df is not None else mcl.guess_role
-    return hm.profile_from_memory(cols, guess, mcl.guess_kind)
+    guess = (lambda c: ml.guess_role_data(c, df[c])) if df is not None else ml.guess_role
+    return hm.profile_from_memory(cols, guess, ml.guess_kind)
 
 
 def get_profile(name, cols=None, df=None):
@@ -170,8 +196,7 @@ def load_sheets(raw, suggest_all=False):
         else:
             print(f"  skipped sheet '{name}': no tags for its headers yet (tag them in the UI, or run with --suggest)")
     if not found:
-        raise SystemExit(f"No sheet matches a saved or built-in profile: {xl.sheet_names}. "
-                         "Run `python mask_columns.py` to mark which columns contain PHI.")
+        raise SystemExit(f"No sheet has saved tags: {xl.sheet_names}. Tag its headers in the UI (run_daily.bat) or use --suggest.")
     return found
 
 
@@ -185,7 +210,7 @@ def name_variants(orig):
     return out
 
 
-def sweep(series, extra_names=None):
+def sweep(series):
     """A value masked once is masked everywhere it appears (longest first, never inside tokens, any capitalisation)."""
     m = {}
     for tok, kind, orig in ps.key_rows:
@@ -229,7 +254,7 @@ def mask(df, prof, anchor, use_presidio):
         vals = [ps.scrub_note(n if pd.notna(n) else "", w) for n, w in zip(df[c], worked)]
         if use_presidio:
             vals = [pl.presidio_scrub(v) for v in vals]
-        out[c] = sweep(pd.Series(vals, index=df.index), None)
+        out[c] = sweep(pd.Series(vals, index=df.index))
     risk = pd.Series("", index=df.index)
     for c in text_cols:
         r = out[c].map(ps.residual)
