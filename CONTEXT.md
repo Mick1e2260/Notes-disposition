@@ -34,21 +34,21 @@ The rule tabs are **parsed at runtime**, so editing the grid or RCA lists change
 ```
 Daily dump (OneDrive, contains PHI)
    │
-   ├─► ar_auto_audit.py   ── rules engine, runs fully local ──► AUDIT RESULT.xlsx (contains PHI; stays local)
+   ├─► ar_auto_audit.py ── rules engine, runs fully local ──► AR Audit Result.xlsx (contains PHI; stays local)
    │
-   └─► phi_scrub.py       ── de-identify ──► SCRUBBED.xlsx  (only file allowed to reach any AI model)
-                                         ├─► QUARANTINE.xlsx (rows still risky; never sent)
-                                         └─► REID KEY.xlsx   (token → real value; local, restricted)
-                                                │
-                              (planned) AI note reviewer: local Ollama first (no BAA in place)
+   └─► AR Audit UI (run_daily.bat / AR-Audit.exe) ── mask ──► MASKED.xlsx   (the only file allowed to reach any AI model)
+                                                         ├─► QUARANTINE.xlsx (rows still risky; never sent, never offered for download)
+                                                         └─► REID KEY.xlsx   (private folder; restores the originals)
+                                                                │
+                                                  local Ollama (Qwen): review / classify the MASKED file
 ```
 
 ### Run
 ```bash
-python ar_auto_audit.py "<workbook.xlsx>" ["<output.xlsx>"]
-python phi_scrub.py     "<workbook.xlsx>" ["<out_dir>"]
+python ar_auto_audit.py "<workbook.xlsx>" ["<output.xlsx>"]    # the audit (this section's rules engine)
+run_daily.bat                                                   # the UI: add a workbook, tag headers, mask, review, download, restore
 ```
-Requires Python 3.10+, `pandas`, `openpyxl`.
+Requires Python 3.12 and `requirements.txt`. `build_exe.bat` builds the same UI as `dist\AR-Audit\AR-Audit.exe`.
 
 ---
 
@@ -142,26 +142,79 @@ Grid Violations (derived status × action) · Derived Status · Client View · F
 
 ---
 
-## 6. PHI handling (no BAA in place)
+## 6. Masking PHI and the UI
 
-- Assume **no BAA** with any AI or cloud vendor. Raw dumps, audit results, quarantine files and the REID KEY **never** go to a cloud service or to git (`.gitignore` blocks `*.xlsx`, `*.csv`, `scrub_out/`).
-- `phi_scrub.py` (Safe Harbor style):
-  - Names, phones, emails, URLs, SSNs, addresses/ZIPs and long IDs become salted-hash tokens (stable across days).
-  - Dates become day offsets from Worked Date (`[D-34]`).
-  - Kept: CPT/HCPCS (including `CPT-` prefixed), ICD-10, modifiers, CARC/RARC, $ amounts, payer names.
-  - A final residual scan quarantines rows that still look risky. On 23-Oct: 1,883 safe, 9 quarantined.
-- Pattern scrubbing is not proof of de-identification. **Compliance must approve** the method and a reviewed ~100-row sample before scrubbed data reaches any external service.
-- Set a private `SALT` in `phi_scrub.py`, and keep it out of git for production.
+**Rules of the house.** There is **no BAA** with any AI or cloud vendor, so raw workbooks, audit results, quarantine files and the
+re-identification key never go to a cloud service or to git (`.gitignore` blocks `*.xlsx`, `*.csv`, saved configs). Everything below
+runs on this PC. Pattern and NER masking is not proof of de-identification: **compliance must approve** the method and a reviewed
+sample before masked files go anywhere outside this PC.
+
+### Workflow (`run_daily.bat`, or `AR-Audit.exe`)
+1. **Workbook:** drop or pick an .xlsx (held in memory only, never saved) or use the newest `AR Audit Result*.xlsx` from OneDrive.
+   Every sheet is listed; title rows above the headers are skipped automatically.
+2. **Column privacy:** headers appear at once with suggested tags. Confirm or change them; they are remembered per file type.
+3. **Run options:** masked Excel only, or masked Excel + local-model review / classification.
+4. **Results:** download the masked workbook (and review output). Warnings, if any, are shown here.
+5. **Restore:** turn a masked workbook back into the originals (separate tool).
+
+`run_daily.bat` serves the page on this PC's network address with a secret key in the link (private-network clients only; Restore only
+from this PC). `run_daily.bat local` keeps it on 127.0.0.1. `run_daily.bat doctor` checks the PC and prints what is wrong.
+
+### The six tags
+| Tag | What happens to the cell |
+|---|---|
+| No PHI | unchanged |
+| PHI | whole value starred, first and last character of each word kept: `SMITH, JOHN` -> `S***H, J**N`; a number is one unit: `(214) 555-0187` -> `(2**) ***-***7` |
+| Identifier | stable token you can group on and restore exactly: `[CLM-AB12CD]` |
+| Date | days from the work date (`DOS (days vs worked)`) |
+| Text | sentence kept; only names, numbers, phones, emails, addresses inside it are starred: `spoke with M***a L***z ref # 4**5, claim 1*******9` |
+| Drop | column removed |
+
+### How Text is masked (`phi_scrub.py`, `presidio_layer.py`, `daily_mask.py`)
+1. Regex rules (`phi_scrub`): names after "spoke with / rep / per", labelled patient names, `LAST, FIRST`, emails, URLs, SSNs, phones,
+   addresses and ZIPs, reference numbers after a label (claim, ICN, auth, ref, EFT...), any other run of 4+ digits, dates of birth.
+   Kept: CPT/HCPCS, ICD-10, CARC/RARC, $ amounts, years, small counts, work dates as written.
+2. Presidio + spaCy NER (`presidio_layer`; payer and client names are allow-listed; custom MRN and reference recognizers).
+3. Sweep: a value masked once is masked everywhere it appears (any capitalisation); patient names from a name column also catch
+   "First Last" and single names inside sentences.
+4. Guards: a candidate name made only of RCM words, or of words from that sheet's own status/action/category columns ("Appeal
+   Submitted", "INSURANCE PLAN, EOB"), is not a person. Placeholders the source already holds (`[CLAIM NUMBER-12]`) are left alone.
+5. Residual scan: rows that still look risky go to QUARANTINE.
+
+### Warning when a No PHI column holds PHI (`phiscan.py`)
+Each No PHI column is run through the masker's own rules without changing anything; if the masker would have masked something the
+column is flagged. Step 2 shows a badge, a banner (with *Apply suggested tags*) and a "Set to X" button; *Start processing* asks
+for confirmation; the run scans the full data (statuses and codes once per distinct value) and reports in the log, in Results and in a
+**PHI Warnings** sheet inside the masked workbook. Output is counts and value shapes (`999-999-9999`), never the values.
+
+### Header memory and saved configs (`headermem.py`, `daily_mask.py`)
+Saving or running remembers every header's tag globally (matched ignoring case, spaces and punctuation) and saves one config per file
+type (file name without its date + a hash of its headers). A new sheet pre-fills remembered headers and marks the rest "new". Both
+files hold headers and tags only, no data, in `%LOCALAPPDATA%\AnkaARAudit\config` (override: `AR_AUDIT_CONFIG_DIR`), shared by the exe and
+python. The salt, the re-ID keys and a counts-only run log are in `%LOCALAPPDATA%\AnkaARAudit\private` (current-user ACL).
+
+### Restore (`reidentify.py`)
+Identifier tokens come back exactly. Starred values come back only when only one original matches (John and Joan both star to `J**n`,
+so `J**n` stays masked rather than restoring the wrong person). Date columns come back as MM/DD/YYYY from the work date (file-name date
+or the date field). Not recoverable: dropped columns, quarantined rows, ambiguous stars. The restored file contains PHI: it is built in
+memory and streamed to the browser, never saved.
+
+### LLM review and classification (`llm_audit.py`, `llm_classify.py`, `llm_context.md`)
+Local Ollama, model `qwen2.5:7b-instruct` (CPU only: roughly 11-20 s per claim). Only the `- MASKED` file is read; every note is
+re-scanned for PHI first and a non-loopback Ollama host is refused. `llm_audit` reviews the claims the rules engine flagged on
+N01/N03/N04/N05/G01 plus a 10% control sample and compares Qwen with the rules (Confirmed / Possible false positive / NEW finding /
+Unclear). `llm_classify` predicts status, action and denial category for an Open AR sheet from labels found in the sheet itself and
+flags rows that differ from what the agent entered. `llm_context.md` is the plain-language brief given to the model; edit it to tune.
+Advisory only: QA confirms before agent feedback.
 
 ---
 
 ## 7. Roadmap
 
-1. **Calibrate (week 1):** QA manually audits about 50 fatal flags plus clean samples. Tune regexes to at least 90% precision, then lock which codes are fatal.
+1. **Calibrate (week 1):** QA manually audits about 50 fatal flags plus clean samples. Tune regexes to at least 90% precision, then lock which codes are fatal. Compare the LLM review with the QA answer key before trusting it.
 2. **Run it daily:** automated 100% check. A QA person confirms fatal flags, plus a random 5% of clean claims.
-3. **AI note reviewer:** on the scrubbed file, a local **Ollama** model (8–14B) returns structured JSON `{status, action, rca, confidence}` constrained to workbook lists. Run it only on flagged claims plus a 10–15% sample (≈300/day). Compare against the QA answer key before trusting it. Switch to a cloud model only if a BAA exists.
-4. **Trends:** 7/30-day agent accuracy, feeding the BQ/PIP governance process. Defect repeat rates by client and payer.
-5. **More checks:**
+3. **Trends:** 7/30-day agent accuracy, feeding the BQ/PIP governance process. Defect repeat rates by client and payer.
+4. **More checks:**
    - Timely-filing risk (age vs payer TFL, especially before adjustments).
    - Adjustment without approval reference.
    - Bill-to-patient on CO group code.
@@ -174,7 +227,17 @@ Grid Violations (derived status × action) · Derived Status · Client View · F
 
 | File | Purpose |
 |---|---|
-| `ar_auto_audit.py` | Rules engine and scorecard writer |
-| `phi_scrub.py` | De-identification, quarantine and re-identification key |
-| `CONTEXT.md` | This document |
-| `.gitignore` | Blocks all data and outputs from git |
+| `ar_auto_audit.py` | Audit rules engine and scorecard writer |
+| `ar_audit.py` | Single entry point (the exe runs this): `ui`, `daily`, `mask`, `review`, `classify`, `doctor` |
+| `webui.py` | The browser UI (page + local API) |
+| `daily_mask.py` | Masks a workbook (every sheet), saved configs, PHI Warnings sheet |
+| `phi_scrub.py` | The masking rules for free text |
+| `presidio_layer.py` | Presidio + spaCy NER pass |
+| `phiscan.py` | Flags No PHI columns that hold PHI |
+| `mask_columns_logic.py` | Tags and the first-guess tag from a header name |
+| `headermem.py` | Header memory |
+| `reidentify.py` | Restores originals from a masked workbook |
+| `llm_audit.py`, `llm_classify.py`, `llm_context.md` | Local-Qwen review and classification, and the model's brief |
+| `doctor.py` | Diagnostic |
+| `run_daily.bat`, `build_exe.bat` | Start the UI; build the exe |
+| `requirements.txt`, `.gitignore`, `CONTEXT.md` | Dependencies, data blocked from git, this document |
