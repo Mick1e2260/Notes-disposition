@@ -6,7 +6,7 @@ Usage:  python daily_mask.py [workbook.xlsx ...] [--date YYYY-MM-DD] [--no-presi
 
 Each sheet's type is detected from its headers (see PROFILES). Per profile:
   1. identity columns -> stable salted tokens; staff/provider columns too
-  2. date columns -> day offsets from the work/anchor date
+  2. date columns -> masked like PHI when tagged PHI, otherwise kept as written
   3. free-text columns -> phi_scrub regex rules, then Presidio + NER (presidio_layer.py), then a sweep that masks every
      value found anywhere (incl. patient names from the name column) in every other text cell
   4. residual-risk scan; risky rows go to QUARANTINE (never sent anywhere)
@@ -122,7 +122,6 @@ def profile_from_roles(name, roles):
     return {"name": name, "match": list(roles),
             "phi": [c for c, r in roles.items() if r == "PHI"],
             "tokens": {c: hm.kind_for(c, ml.guess_kind) for c, r in roles.items() if r == "Identifier"},
-            "dates": [c for c, r in roles.items() if r == "Date"],
             "text": [c for c, r in roles.items() if r == "Text"],
             "drop": [c for c, r in roles.items() if r == "Drop"]}
 
@@ -230,17 +229,13 @@ def mask(df, prof, anchor, use_presidio):
     p = get_profile(prof, list(df.columns), df)
     fixed_drops = ps.DROP_COLS if prof in PROFILES else []  # your own config decides drops for everything else
     out = df.drop(columns=[c for c in fixed_drops + p.get("drop", []) if c in df.columns]).copy()
-    for col in p.get("phi", []):  # whole value starred: SMITH, JOHN -> S***H, J**N
+    for col in p.get("phi", []) + p.get("dates", []):  # whole value starred: SMITH, JOHN -> S***H, J**N (old Date columns too)
         if col in out.columns:
             out[col] = df[col].map(lambda v: ps.token("PHI", v, "star") if pd.notna(v) and str(v).strip() else v)
     for col, kind in p["tokens"].items():  # stable token you can group on and restore exactly
         if col in out.columns:
             out[col] = df[col].map(lambda v, k=kind: ps.token(k, v, "token") if pd.notna(v) else v)
     worked = pd.to_datetime(df["Worked Date"]) if "Worked Date" in df.columns else pd.Series(anchor, index=df.index)
-    for c in p["dates"]:
-        if c in df.columns:
-            out[c] = (pd.to_datetime(df[c], errors="coerce") - worked.dt.normalize()).dt.days
-            out = out.rename(columns={c: f"{c} (days vs worked)"})
     if prof in ("memory", "suggest"):
         guessed = suggested(list(df.columns), df)[1]
         if guessed:
@@ -260,8 +255,9 @@ def mask(df, prof, anchor, use_presidio):
         r = out[c].map(ps.residual)
         risk = risk.where(r == "", r)
     out["Residual Risk"] = risk
+    out.attrs["id_cols"] = [c for c in p["tokens"] if c in out.columns]
     # a column left as No PHI that still holds something the masking rules would mask -> warn (never changed here)
-    handled = set(p["tokens"]) | set(p["dates"]) | set(p["text"]) | set(p.get("drop", [])) | set(p.get("phi", []))
+    handled = set(p["tokens"]) | set(p.get("dates", [])) | set(p["text"]) | set(p.get("drop", [])) | set(p.get("phi", []))
     untagged = [c for c in df.columns if c not in handled and c in out.columns]
     cand = vocab_candidates(df, p)
     out.attrs["phi_warnings"] = phiscan.scan_columns(
@@ -272,7 +268,7 @@ def mask(df, prof, anchor, use_presidio):
 def vocab_candidates(df, p):
     """{column: words} for this sheet's No PHI category-style columns (Last Resolution Action, Status Source, RCA...).
     Phrases built only from these words are statuses, not people, so the name rules leave them alone."""
-    tagged = set(p["tokens"]) | set(p["dates"]) | set(p["text"]) | set(p.get("phi", [])) | set(p.get("drop", []))
+    tagged = set(p["tokens"]) | set(p.get("dates", [])) | set(p["text"]) | set(p.get("phi", [])) | set(p.get("drop", []))
     cand = {}
     for c in df.columns:
         s = df[c].dropna()
@@ -297,6 +293,7 @@ def process(raw, filename, anchor, use_presidio=True, suggest_all=False):
     safe_path = MASKED_DIR / f"{stem} - MASKED.xlsx"
     ps.key_rows.clear()
     warnings = []
+    with_orig = {}  # sheet -> masked rows plus an "(Original)" column beside every Identifier column
     with pd.ExcelWriter(safe_path) as ws, pd.ExcelWriter(MASKED_DIR / f"{stem} - QUARANTINE.xlsx") as wq:
         for name, prof, df in sheets:
             out = mask(df, prof, anchor, use_presidio)
@@ -306,6 +303,12 @@ def process(raw, filename, anchor, use_presidio=True, suggest_all=False):
                 print(f"  WARNING: {name} | {w['column']} | {w['found']} | {w['suggest']}")
             safe = out[out["Residual Risk"] == ""].drop(columns="Residual Risk")
             quar = out[out["Residual Risk"] != ""]
+            ids = out.attrs.get("id_cols", [])
+            if ids:
+                wo = safe.copy()
+                for c in ids:
+                    wo.insert(wo.columns.get_loc(c) + 1, f"{c} (Original)", df.loc[wo.index, c])
+                with_orig[name[:31]] = wo
             safe.to_excel(ws, sheet_name=name[:31], index=False)
             quar.to_excel(wq, sheet_name=name[:31], index=False)
             line = (f"{datetime.now():%Y-%m-%d %H:%M} | {filename} | '{name}' ({prof}) | rows {len(df)} | "
@@ -317,6 +320,10 @@ def process(raw, filename, anchor, use_presidio=True, suggest_all=False):
                 print(quar["Residual Risk"].str.split(", ").explode().value_counts().to_string())
         if warnings:  # the flag travels with the file: anyone opening the masked workbook sees which columns to double-check
             pd.DataFrame(warnings).to_excel(ws, sheet_name="PHI Warnings", index=False)
+    if with_orig:  # holds the real identifiers: stays on this PC, never read by the LLM steps
+        with pd.ExcelWriter(MASKED_DIR / f"{stem} - WITH ORIGINALS.xlsx") as wo_w:
+            for sn, wo in with_orig.items():
+                wo.to_excel(wo_w, sheet_name=sn, index=False)
     if warnings:
         print(f"  {len(warnings)} column(s) tagged No PHI still look sensitive: see the PHI Warnings sheet")
     key = pd.DataFrame(ps.key_rows, columns=["Token", "Type", "Original"]).drop_duplicates(["Token", "Original"])

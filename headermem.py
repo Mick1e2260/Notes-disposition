@@ -19,6 +19,7 @@ CONFIG_DIR = Path(os.environ.get("AR_AUDIT_CONFIG_DIR") or Path(os.environ["LOCA
 FILE = CONFIG_DIR / "header_memory.json"
 COVERAGE = 0.7  # share of a sheet's headers that must be remembered before a headless run trusts the memory
 _cache = {"mtime": None, "data": {}}
+LEGACY = {"Date": "PHI"}  # the Date tag no longer exists: a column remembered as Date is now masked as PHI
 
 
 def norm(h):
@@ -61,7 +62,7 @@ def role_map(cols, guess_role, guess_kind):
     roles, src = {}, {}
     for c in cols:
         e = lookup(c)
-        roles[c], src[c] = (e["role"], "remembered") if e else (guess_role(c), "guessed")
+        roles[c], src[c] = (LEGACY.get(e["role"], e["role"]), "remembered") if e else (guess_role(c), "guessed")
     return roles, src
 
 
@@ -76,7 +77,6 @@ def profile_from_memory(cols, guess_role, guess_kind):
     prof = {"detect": set(cols), "marked": False,
             "phi": [c for c, r in roles.items() if r == "PHI"],
             "tokens": {c: kind_for(c, guess_kind) for c, r in roles.items() if r == "Identifier"},
-            "dates": [c for c, r in roles.items() if r == "Date"],
             "text": [c for c, r in roles.items() if r == "Text"],
             "drop": [c for c, r in roles.items() if r == "Drop"]}
     return prof, [c for c, s in src.items() if s == "guessed"]

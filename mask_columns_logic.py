@@ -4,13 +4,12 @@ Column roles and the first-pass guess from a header name (pure logic, no GUI).
   No PHI      leave the column exactly as it is
   PHI         mask the whole value, keeping first and last character:  SMITH, JOHN -> S***H, J**N
   Identifier  replace with a stable token you can group/join on and restore exactly:  [CLM-AB12CD]
-  Date        replace with days relative to the work date
   Text        a sentence: mask only the sensitive parts inside it (names, numbers, phones), keep the wording
   Drop        remove the column from the masked file
 """
 import re
 
-ROLES = ["No PHI", "PHI", "Identifier", "Date", "Text", "Drop"]
+ROLES = ["No PHI", "PHI", "Identifier", "Text", "Drop"]
 
 KIND_GUESS = [("mrn|chart", "MRN"), (r"patient|\bpt\b|responsible|insured|subscriber|guarantor|^name|\bname$", "PAT"),
               ("claim", "CLM"), ("bill", "BIL"), ("account|acct", "ACC"),
@@ -38,7 +37,7 @@ def guess_role(col):
     """First-pass role from the header text; you confirm or change it in the UI."""
     c = str(col).lower()
     if re.search(DATE_HINT, c) and not re.search(NOT_DATE, c):
-        return "Date"
+        return "PHI" if re.search(r"dob|birth", c) else "No PHI"  # work dates stay as written; a birth date is masked
     if re.search(TEXT_HINT, c):
         return "Text"
     if re.search(NOT_PHI, c) and not re.search(PERSON_ID, c):

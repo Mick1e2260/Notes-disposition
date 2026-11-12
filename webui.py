@@ -127,7 +127,7 @@ def columns_of(path, sheet):
     roles, src = hm.role_map(cols, lambda c: ml.guess_role_data(c, df[c]), ml.guess_kind)
     prof = dm.detect_profile(cols)
     cand = dm.vocab_candidates(df, {k: [c for c, r in roles.items() if r == role] for k, role in
-                                    (("tokens", "Identifier"), ("dates", "Date"), ("text", "Text"), ("phi", "PHI"), ("drop", "Drop"))})
+                                    (("tokens", "Identifier"), ("text", "Text"), ("phi", "PHI"), ("drop", "Drop"))})
     ps.VOCAB = set().union(*cand.values()) if cand else set()
     anchor = dm.anchor_date(Path(name_of(path)), None)
     # every column is scanned (not only the ones tagged No PHI now), so choosing No PHI later flags instantly
@@ -149,9 +149,6 @@ def preview(path, sheet, col, role):
                 out.append(ps.star(v))
             elif role == "Identifier":
                 out.append(ps.token(hm.kind_for(col, ml.guess_kind), v, "token"))
-            elif role == "Date":
-                d = pd.to_datetime(v, errors="coerce")
-                out.append("unreadable date" if pd.isna(d) else f"{(d - pd.Timestamp(anchor)).days:+d} days from work date")
             elif role == "Text":
                 import presidio_layer as pl
                 out.append(pl.presidio_scrub(ps.scrub_note(str(v), anchor)))
@@ -187,7 +184,7 @@ def mask_uploaded(opts):
     path = opts["path"]
     try:
         with contextlib.redirect_stdout(_Say()):
-            dm.process(raw_of(path), name_of(path), dm.anchor_date(Path(name_of(path)), opts.get("date") or None),
+            dm.process(raw_of(path), name_of(path), dm.anchor_date(Path(name_of(path)), None),
                        opts.get("presidio", True), suggest_all=True)
         return True
     except BaseException as e:  # includes SystemExit raised for 'no matching sheet'
@@ -241,11 +238,13 @@ def _run_job(opts):
     JOB.update(done=True, ok=ok, running=False)
 
 
-def outputs():
-    """Masked results that may be downloaded. QUARANTINE files stay local (they hold rows that still look risky)."""
+def outputs(local=False):
+    """Masked results that may be downloaded. QUARANTINE files stay local (they hold rows that still look risky);
+    WITH ORIGINALS (masked rows plus the real Identifier values) is offered only to the person at this PC."""
     if not dm.MASKED_DIR.exists():
         return []
-    fs = [f for f in dm.MASKED_DIR.glob("*.xlsx") if not f.name.startswith("~$") and not f.stem.endswith("QUARANTINE")]
+    fs = [f for f in dm.MASKED_DIR.glob("*.xlsx") if not f.name.startswith("~$") and not f.stem.endswith("QUARANTINE")
+          and (local or not f.stem.endswith("WITH ORIGINALS"))]
     fs.sort(key=lambda f: f.stat().st_mtime, reverse=True)
     return [{"name": f.name, "kind": "masked" if f.stem.endswith("MASKED") else "result",
              "when": datetime.fromtimestamp(f.stat().st_mtime).strftime("%d %b %H:%M"), "kb": round(f.stat().st_size / 1024)}
@@ -301,10 +300,13 @@ class H(BaseHTTPRequestHandler):
         if not self._ok():
             return self._send(403, {"error": "bad host"})
         if u.path == "/":
-            if parse_qs(u.query).get("k", [""])[0] != TOKEN:
-                return self._send(403, b"<h3>This is AR Audit, but the key in this link does not match.</h3><p>Use the link printed in the window "
-                                      b"that started AR Audit (it ends with ?k=...). If AR Audit was started more than once, close the "
-                                      b"other windows first.</p>", "text/html")
+            ip = SERVER_IP["ip"]
+            if ip and (self.headers.get("Host") or "").split(":")[0].lower() != ip:  # network mode: always land on the network link
+                self.send_response(302)
+                self.send_header("Location", f"http://{ip}:{self.server.server_address[1]}/")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             return self._send(200, PAGE.replace("__TOKEN__", TOKEN).encode(), "text/html")
         if self.headers.get("X-Token") != TOKEN:
             return self._send(403, {"error": "bad token"})
@@ -321,9 +323,9 @@ class H(BaseHTTPRequestHandler):
             if u.path == "/api/columns":
                 return self._send(200, columns_of(q["path"], q["sheet"]))
             if u.path == "/api/outputs":
-                return self._send(200, {"files": outputs()})
+                return self._send(200, {"files": outputs(self._local_client())})
             if u.path == "/api/download":
-                if q["file"] not in {o["name"] for o in outputs()}:
+                if q["file"] not in {o["name"] for o in outputs(self._local_client())}:
                     return self._send(404, {"error": "not an available result"})
                 return self._file(q["file"], (dm.MASKED_DIR / q["file"]).read_bytes())
             if u.path == "/api/preview":
@@ -354,13 +356,13 @@ class H(BaseHTTPRequestHandler):
                 return self._send(200, {"path": "mem:" + uid, "name": name})
             if u == "/api/restore":
                 if not self._local_client():
-                    return self._send(403, {"error": "Restore is only available from the PC that runs AR Audit"})
+                    return self._send(403, {"error": "Restore is only available from the PC that runs AnkaShield"})
                 known = {o["name"] for o in outputs()}
                 src = raw if raw else ((dm.MASKED_DIR / qs["out"]).read_bytes() if qs.get("out") in known else None)
                 if src is None:
                     return self._send(400, {"error": "choose a masked workbook"})
                 fname = qs.get("name") or qs.get("out") or "masked.xlsx"
-                anchor = dm.anchor_date(Path(fname), qs.get("date") or None)
+                anchor = dm.anchor_date(Path(fname), None)
                 data, st = reidentify.restore_bytes(src, anchor)
                 stem = re.sub(r"\s*-\s*(MASKED|CLASSIFIED|LLM REVIEW)$", "", Path(fname).stem)
                 return self._file(stem + " - RESTORED.xlsx", data,
@@ -417,7 +419,7 @@ class Server(ThreadingHTTPServer):
     allow_reuse_address = False
 
     def server_bind(self):
-        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):  # Windows: never share the port with another copy of AR Audit
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):  # Windows: never share the port with another copy of AnkaShield
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
         super().server_bind()
 
@@ -440,14 +442,13 @@ def main(network=False, port=8765):
     srv = open_server(host, port)
     pt = srv.server_address[1]
     if pt != port:
-        print(f"  Port {port} is already in use by another program (probably another AR Audit window), so port {pt} is used.", flush=True)
-    local = f"http://127.0.0.1:{pt}/?k={TOKEN}"
-    print("AR Audit is running. Close this window or press Quit in the page to stop.", flush=True)
+        print(f"  Port {port} is already in use by another program (probably another AnkaShield window), so port {pt} is used.", flush=True)
+    local = f"http://127.0.0.1:{pt}/"
+    print("AnkaShield is running. Close this window or press Quit in the page to stop.", flush=True)
     if network:
-        link = f"http://{ip}:{pt}/?k={TOKEN}"
+        link = f"http://{ip}:{pt}/"
         print(f"  Network link : {link}", flush=True)
-        print(f"  This PC only : {local}", flush=True)
-        print("  The link holds a secret key: share it only with people allowed to see masked data.", flush=True)
+        print("  Anyone on this office network who has the link can use AnkaShield: share it only with people allowed to see masked data.", flush=True)
         print("  Restore (original values) works only from this PC. If Windows asks, allow access on Private networks.", flush=True)
         webbrowser.open(link)
     else:
@@ -461,7 +462,7 @@ def main(network=False, port=8765):
 
 PAGE = r'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>AR Audit</title>
+<title>AnkaShield</title>
 <style>
 :root{
   --bg:oklch(97.5% .008 175);--surface:oklch(99% .004 175);--ink:oklch(24% .02 195);--muted:oklch(46% .02 195);
@@ -569,7 +570,7 @@ section.panel h2{font-size:27px;margin-bottom:8px} section.panel .hint{font-size
 .hot{color:var(--warn);font-weight:600}button.small{min-height:30px;padding:0 12px;font-size:12.5px}
 </style></head><body><main>
 <header>
-  <div><h1>AR Audit</h1><p class="sub">Mask PHI on this PC, then review notes with a local model. Nothing leaves this machine.</p></div>
+  <div><h1>AnkaShield</h1><p class="sub">Mask PHI on this PC, then review notes with a local model. Nothing leaves this machine.</p></div>
   <div class="chips"><span class="chip" id="oll"><i></i><span>Ollama</span></span><button class="quiet" id="quit" title="Stop the local server">Quit</button></div>
 </header>
 
@@ -628,8 +629,6 @@ section.panel h2{font-size:27px;margin-bottom:8px} section.panel .hint{font-size
   <p class="hint">Turns a masked workbook back into the real values using the private key on this PC. The restored file contains PHI: it is built in memory and downloaded straight to you, never saved here.</p>
   <div class="row"><select id="rsel" aria-label="Masked workbook"></select><span class="muted">or</span>
     <button id="raddbtn">Add a masked workbook…</button><input type="file" id="rfile" accept=".xlsx,.xlsm" hidden><span id="rname" class="muted"></span></div>
-  <div class="row" style="margin-top:10px"><label class="chk">Work date <input type="date" id="rdate"></label>
-    <span class="muted">Only needed if the file name has no date. Turns day offsets back into dates.</span></div>
   <div class="row" style="margin-top:16px"><button class="primary" id="restore">Restore and download</button><span class="state" id="rstate"></span></div>
   <p class="muted" id="rnote" style="margin-top:10px"></p>
 </div></section>
@@ -655,7 +654,7 @@ $('mode').onchange=showMode;showMode();
 const known=()=>Object.keys(SRC).forEach(k=>SRC[k]="remembered");
 const esc=x=>String(x).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const HITLBL={phone:"phone numbers",email:"emails",ssn:"SSN-like numbers",address:"addresses",id:"IDs / long numbers",name:"person names",url:"links",dob:"dates of birth"};
-const ROLEHELP={"No PHI":"Left exactly as it is.","PHI":"Whole value masked, first and last character kept: S***H, J**N.","Identifier":"Each value becomes a stable token you can group on and restore: [CLM-AB12CD].","Date":"Becomes days from the work date.","Text":"Sentence kept; only names, numbers, phones and emails inside it are masked.","Drop":"Removed from the masked file."};
+const ROLEHELP={"No PHI":"Left exactly as it is.","PHI":"Whole value masked, first and last character kept: S***H, J**N.","Identifier":"Each value becomes a stable token you can group on and restore: [CLM-AB12CD].","Text":"Sentence kept; only names, numbers, phones and emails inside it are masked.","Drop":"Removed from the masked file."};
 const sens=c=>Object.values((STATS[c]||{}).hits||{}).reduce((a,v)=>a+v,0);
 const flagged=c=>roles[c]==="No PHI"&&sens(c)>0;
 const foundText=c=>Object.entries((STATS[c]||{}).hits||{}).sort((a,b)=>b[1]-a[1]).map(([k,v])=>`${v} ${HITLBL[k]}`).join(", ");
@@ -665,7 +664,7 @@ function detail(c){
   const shapes=(s.shapes||[]).map(([k,v])=>`<div><code>${esc(k)}</code><span>${v} cells</span></div>`).join("");
   const sg=esc(s.suggest||"Text");
   const fnote=flagged(c)?`<p class="warn-t">Tagged <b>No PHI</b>, but the masking rules would have masked this in ${sens(c)} of ${s.scanned} checked cells. Suggested tag: <b>${sg}</b>. <button class="small setrole" data-r="${sg}">Set to ${sg}</button></p>`:"";
-  const dnote=role==="No PHI"&&s.type==="date"?'<p class="warn-t">Dates tied to a patient count as PHI under Safe Harbor. Consider “Date”.</p>':"";
+  const dnote=role==="No PHI"&&s.type==="date"?'<p class="warn-t">Dates tied to a patient count as PHI under Safe Harbor. Consider “PHI”.</p>':"";
   return `<div class="dgrid"><div><b>${s.filled}%</b><small>filled</small></div><div><b>${s.distinct}</b><small>distinct</small></div><div><b>${s.type}</b><small>type</small></div><div><b>${s.avg_len}</b><small>avg length</small></div></div>
   <h4>The masking rules find</h4><div class="tags">${hits}</div>${fnote}${dnote}
   ${shapes?`<h4>Common value shapes</h4><div class="shapes">${shapes}</div>`:""}
@@ -744,7 +743,7 @@ $("run").onclick=async()=>{
   $("log").textContent="";since=0;$("state").textContent="";$("run").disabled=true;$("loading").classList.add("active");
   try {
   if(Object.keys(roles).length){const m=await post("/api/profile",{path:p,sheet:$("sheet").value,roles});$("log").textContent=m.error?"":`Using the ${m.saved} column marks shown in Step 2 (saved and remembered).\n`;if(!m.error){known();renderCols()}}
-  const r=await post("/api/run",{path:p,mode:$("mode").value,model:$("model").value,limit:+$("limit").value,presidio:$("presidio").checked,date:$("rdate").value});
+  const r=await post("/api/run",{path:p,mode:$("mode").value,model:$("model").value,limit:+$("limit").value,presidio:$("presidio").checked});
   if(r.error){$("log").textContent=r.error;$("run").disabled=false;$("loading").classList.remove("active");$("state").className="state fail";$("state").textContent=r.error;goStep(4);return}
   timer=setInterval(poll,700);
   } catch(e){finishError(e)}
@@ -792,7 +791,7 @@ $("restore").onclick=async()=>{
   $("rstate").textContent="";$("rnote").textContent="";
   if(!rfile&&!$("rsel").value){$("rstate").className="state fail";$("rstate").textContent="Choose a masked workbook";return}
   if(!confirm("The restored workbook contains PHI. It is created in memory and downloaded to this browser only. Continue?"))return;
-  const q=new URLSearchParams(rfile?{name:rfile.name}:{out:$("rsel").value,name:$("rsel").value});if($("rdate").value)q.set("date",$("rdate").value);
+  const q=new URLSearchParams(rfile?{name:rfile.name}:{out:$("rsel").value,name:$("rsel").value});
   $("restore").disabled=true;
   try{
     const r=await fetchFile("/api/restore?"+q,{method:"POST",headers:{"Content-Type":"application/octet-stream"},body:rfile||undefined});

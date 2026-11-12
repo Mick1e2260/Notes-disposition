@@ -1,5 +1,5 @@
 """
-`ar_audit doctor` (or `run_daily.bat doctor`): checks everything AR Audit depends on and prints PASS / FAIL with the fix.
+`ar_audit doctor` (or `run_daily.bat doctor`): checks everything AnkaShield depends on and prints PASS / FAIL with the fix.
 Reads no workbook data. Paste the output if something is still wrong.
 """
 import importlib
@@ -24,7 +24,7 @@ def main():
     import webui
 
     frozen = getattr(sys, "frozen", False)
-    print(f"AR Audit doctor | {'exe' if frozen else 'python ' + sys.version.split()[0]} | {sys.executable}\n")
+    print(f"AnkaShield doctor | {'exe' if frozen else 'python ' + sys.version.split()[0]} | {sys.executable}\n")
 
     for mod in ("pandas", "openpyxl", "presidio_analyzer", "spacy"):
         check(f"library {mod}", lambda m=mod: (bool(importlib.import_module(m)), ""))
@@ -74,8 +74,8 @@ def main():
             except Exception as e:
                 code = getattr(e, "code", None)
                 if code == 403:
-                    return True, "port 8765 is in use by a running AR Audit (the page answers). Close its window to restart"
-            return False, "port 8765 is taken by another program; AR Audit will use the next free port (the link changes)"
+                    return True, "port 8765 is in use by a running AnkaShield (the page answers). Close its window to restart"
+            return False, "port 8765 is taken by another program; AnkaShield will use the next free port (the link changes)"
         finally:
             s.close()
     check("port 8765", port_state)
