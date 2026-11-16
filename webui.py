@@ -238,13 +238,11 @@ def _run_job(opts):
     JOB.update(done=True, ok=ok, running=False)
 
 
-def outputs(local=False):
-    """Masked results that may be downloaded. QUARANTINE files stay local (they hold rows that still look risky);
-    WITH ORIGINALS (masked rows plus the real Identifier values) is offered only to the person at this PC."""
+def outputs():
+    """Masked results that may be downloaded. QUARANTINE files stay local (they hold rows that still look risky)."""
     if not dm.MASKED_DIR.exists():
         return []
-    fs = [f for f in dm.MASKED_DIR.glob("*.xlsx") if not f.name.startswith("~$") and not f.stem.endswith("QUARANTINE")
-          and (local or not f.stem.endswith("WITH ORIGINALS"))]
+    fs = [f for f in dm.MASKED_DIR.glob("*.xlsx") if not f.name.startswith("~$") and not f.stem.endswith("QUARANTINE")]
     fs.sort(key=lambda f: f.stat().st_mtime, reverse=True)
     return [{"name": f.name, "kind": "masked" if f.stem.endswith("MASKED") else "result",
              "when": datetime.fromtimestamp(f.stat().st_mtime).strftime("%d %b %H:%M"), "kb": round(f.stat().st_size / 1024)}
@@ -323,9 +321,9 @@ class H(BaseHTTPRequestHandler):
             if u.path == "/api/columns":
                 return self._send(200, columns_of(q["path"], q["sheet"]))
             if u.path == "/api/outputs":
-                return self._send(200, {"files": outputs(self._local_client())})
+                return self._send(200, {"files": outputs()})
             if u.path == "/api/download":
-                if q["file"] not in {o["name"] for o in outputs(self._local_client())}:
+                if q["file"] not in {o["name"] for o in outputs()}:
                     return self._send(404, {"error": "not an available result"})
                 return self._file(q["file"], (dm.MASKED_DIR / q["file"]).read_bytes())
             if u.path == "/api/preview":

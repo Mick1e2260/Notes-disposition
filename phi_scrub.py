@@ -15,6 +15,7 @@ import re
 
 NOTES = "Notes (PHI Safe"
 # Private salt: same salt -> stable tokens across days. daily_mask.private_setup() generates it and keeps it outside the repo.
+ORIG_TAG = "(Originals)"  # a sheet named "... (Originals)" holds real identifier values: the LLM steps and Restore skip it
 SALT = ""
 
 # Columns that carry identifiers and are not needed by an AI reviewer

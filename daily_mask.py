@@ -318,12 +318,10 @@ def process(raw, filename, anchor, use_presidio=True, suggest_all=False):
             print(line)
             if len(quar):
                 print(quar["Residual Risk"].str.split(", ").explode().value_counts().to_string())
+        for sn, wo in with_orig.items():  # real identifiers beside the tokens, on their own sheet (skipped by the LLM steps and Restore)
+            wo.to_excel(ws, sheet_name=f"{sn[:31 - len(ps.ORIG_TAG) - 1]} {ps.ORIG_TAG}", index=False)
         if warnings:  # the flag travels with the file: anyone opening the masked workbook sees which columns to double-check
             pd.DataFrame(warnings).to_excel(ws, sheet_name="PHI Warnings", index=False)
-    if with_orig:  # holds the real identifiers: stays on this PC, never read by the LLM steps
-        with pd.ExcelWriter(MASKED_DIR / f"{stem} - WITH ORIGINALS.xlsx") as wo_w:
-            for sn, wo in with_orig.items():
-                wo.to_excel(wo_w, sheet_name=sn, index=False)
     if warnings:
         print(f"  {len(warnings)} column(s) tagged No PHI still look sensitive: see the PHI Warnings sheet")
     key = pd.DataFrame(ps.key_rows, columns=["Token", "Type", "Original"]).drop_duplicates(["Token", "Original"])

@@ -65,13 +65,13 @@ def main():
     if src is None:
         for f in sorted(dm.MASKED_DIR.glob("* - MASKED.xlsx"), key=lambda p: p.stat().st_mtime, reverse=True):
             if any(dm.builtin_profile(pd.read_excel(f, sheet_name=n, nrows=0).columns) == "inventory"
-                   for n in pd.ExcelFile(f).sheet_names):
+                   for n in pd.ExcelFile(f).sheet_names if not n.endswith(ps.ORIG_TAG)):
                 src = f
                 break
     if src is None or "MASKED" not in src.name:
         raise SystemExit("Need a '- MASKED' workbook with an inventory sheet (run daily_mask.py first).")
     xl = pd.ExcelFile(src)
-    name = next(n for n in xl.sheet_names if dm.builtin_profile(pd.read_excel(xl, n, nrows=0).columns) == "inventory")
+    name = next(n for n in xl.sheet_names if not n.endswith(ps.ORIG_TAG) and dm.builtin_profile(pd.read_excel(xl, n, nrows=0).columns) == "inventory")
     df = pd.read_excel(xl, name)
 
     for c in TEXT:

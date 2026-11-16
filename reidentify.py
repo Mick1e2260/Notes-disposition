@@ -66,6 +66,8 @@ def restore_bytes(raw, anchor):
     buf = io.BytesIO()
     with pd.ExcelWriter(buf) as w:
         for name in xl.sheet_names:
+            if name.endswith(dm.ps.ORIG_TAG):
+                continue
             df = pd.read_excel(xl, name)
             for c in list(df.columns):
                 if str(c).endswith(DAYS_SUFFIX) and pd.api.types.is_numeric_dtype(df[c]):

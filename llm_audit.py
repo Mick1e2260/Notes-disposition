@@ -86,7 +86,7 @@ def main():
     # the masked workbook holds every sheet of the audit result; the review needs the line-level findings sheet
     xl = pd.ExcelFile(src)
     need = {"#", "Code", NOTES}
-    sheet = next((n for n in xl.sheet_names if need <= set(pd.read_excel(xl, n, nrows=0).columns)), None)
+    sheet = next((n for n in xl.sheet_names if not n.endswith(ps.ORIG_TAG) and need <= set(pd.read_excel(xl, n, nrows=0).columns)), None)
     if sheet is None:
         raise SystemExit(f"No sheet in {src.name} has the columns {sorted(need)} (the audit's line-level findings).")
     df = pd.read_excel(xl, sheet)
