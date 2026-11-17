@@ -225,6 +225,9 @@ def sweep(series):
     return series.map(lambda t: rx.sub(lambda g: m[g.group(1).lower()], t) if t else t)
 
 
+PROGRESS = {"total": 0, "done": 0}  # work units for the page's progress bar and time left
+
+
 def mask(df, prof, anchor, use_presidio):
     p = get_profile(prof, list(df.columns), df)
     fixed_drops = ps.DROP_COLS if prof in PROFILES else []  # your own config decides drops for everything else
@@ -246,15 +249,23 @@ def mask(df, prof, anchor, use_presidio):
         import presidio_layer as pl
         pl.allow(v for c in ALLOW_COLS if c in df.columns for v in df[c].dropna().astype(str).unique())
     for c in text_cols:
-        vals = [ps.scrub_note(n if pd.notna(n) else "", w) for n, w in zip(df[c], worked)]
+        vals = []
+        for n, w in zip(df[c], worked):
+            vals.append(ps.scrub_note(n if pd.notna(n) else "", w))
+            PROGRESS["done"] += 1
         if use_presidio:
-            vals = [pl.presidio_scrub(v) for v in vals]
+            pv = []
+            for v in vals:
+                pv.append(pl.presidio_scrub(v))
+                PROGRESS["done"] += 1
+            vals = pv
         out[c] = sweep(pd.Series(vals, index=df.index))
     risk = pd.Series("", index=df.index)
     for c in text_cols:
         r = out[c].map(ps.residual)
         risk = risk.where(r == "", r)
     out["Residual Risk"] = risk
+    PROGRESS["done"] += len(df)
     out.attrs["id_cols"] = [c for c in p["tokens"] if c in out.columns]
     # a column left as No PHI that still holds something the masking rules would mask -> warn (never changed here)
     handled = set(p["tokens"]) | set(p.get("dates", [])) | set(p["text"]) | set(p.get("drop", [])) | set(p.get("phi", []))
@@ -293,6 +304,11 @@ def process(raw, filename, anchor, use_presidio=True, suggest_all=False):
     safe_path = MASKED_DIR / f"{stem} - MASKED.xlsx"
     ps.key_rows.clear()
     warnings = []
+    PROGRESS.update(total=0, done=0)
+    for _, prof, df in sheets:
+        t = len([c for c in get_profile(prof, list(df.columns), df)["text"] if c in df.columns])
+        PROGRESS["total"] += len(df) * (1 + t * (2 if use_presidio else 1))
+    PROGRESS["total"] += max(1, PROGRESS["total"] // 20)  # writing the files
     with_orig = {}  # sheet -> masked rows plus an "(Original)" column beside every Identifier column
     with pd.ExcelWriter(safe_path) as ws, pd.ExcelWriter(MASKED_DIR / f"{stem} - QUARANTINE.xlsx") as wq:
         for name, prof, df in sheets:
@@ -326,6 +342,7 @@ def process(raw, filename, anchor, use_presidio=True, suggest_all=False):
         print(f"  {len(warnings)} column(s) tagged No PHI still look sensitive: see the PHI Warnings sheet")
     key = pd.DataFrame(ps.key_rows, columns=["Token", "Type", "Original"]).drop_duplicates(["Token", "Original"])
     key.to_excel(PRIVATE_DIR / f"{stem} - REID KEY {datetime.now():%Y%m%d-%H%M%S}.xlsx", index=False)
+    PROGRESS["done"] = PROGRESS["total"]
     print(f"masked -> {safe_path} | tokens {len(key)}")
     return safe_path
 

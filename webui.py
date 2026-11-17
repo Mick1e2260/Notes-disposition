@@ -16,6 +16,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 import urllib.request
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -291,7 +292,8 @@ class H(BaseHTTPRequestHandler):
             if u.path == "/api/job":
                 since = int(q.get("since", 0))
                 with LOCK:
-                    return self._send(200, {"lines": JOB["lines"][since:], "n": len(JOB["lines"]), "done": JOB["done"], "ok": JOB["ok"]})
+                    return self._send(200, {"lines": JOB["lines"][since:], "n": len(JOB["lines"]), "done": JOB["done"], "ok": JOB["ok"],
+                                            "progress": dict(dm.PROGRESS), "elapsed": time.time() - JOB.get("t0", time.time())})
         except Exception as e:
             return self._send(400, {"error": f"{type(e).__name__}: {e}"})
         self._send(404, {"error": "not found"})
@@ -337,7 +339,8 @@ class H(BaseHTTPRequestHandler):
                 with LOCK:
                     if JOB["running"]:
                         return self._send(409, {"error": "already running"})
-                    JOB.update(lines=[], done=False, ok=True, running=True)
+                    JOB.update(lines=[], done=False, ok=True, running=True, t0=time.time())
+                    dm.PROGRESS.update(total=0, done=0)
                 threading.Thread(target=run_job, args=(body,), daemon=True).start()
                 return self._send(200, {"started": True})
             if u == "/api/open":
@@ -517,6 +520,7 @@ section.panel h2{font-size:27px;margin-bottom:8px} section.panel .hint{font-size
 #log{min-height:0;max-height:220px} details{margin-top:20px} summary{cursor:pointer;color:var(--muted);font-weight:600}
 .loading{position:fixed;inset:0;z-index:5;background:var(--bg);display:none;place-items:center;padding:24px}.loading.active{display:grid}
 .loading-card{text-align:center;max-width:440px}.spinner{width:70px;height:70px;border:5px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:spin 1s linear infinite;margin:0 auto 28px}
+.bar{height:10px;border-radius:6px;background:var(--line);overflow:hidden;margin:0 0 12px}.bar i{display:block;height:100%;width:0;background:var(--accent);transition:width .4s var(--ease)}.pct{font:600 22px var(--display);color:var(--ink)!important;margin:6px 0}
 @keyframes spin{to{transform:rotate(360deg)}} .loading h2{font-size:28px}.loading p{color:var(--muted)}
 @media(max-width:700px){section.panel{padding:22px}.navstep{padding:7px}.navstep .navlabel{display:none}.navstep.active .navlabel{display:inline}.actions{flex-wrap:wrap}}
 @media(prefers-reduced-motion:reduce){.spinner{animation:none;border-top-color:var(--accent);border-right-color:var(--accent)}}
@@ -583,7 +587,7 @@ section.panel h2{font-size:27px;margin-bottom:8px} section.panel .hint{font-size
   <p class="muted" id="rnote" style="margin-top:10px"></p>
 </div></section>
 </main>
-<div class="loading" id="loading" role="status" aria-live="polite"><div class="loading-card"><div class="spinner" aria-hidden="true"></div><h2>Processing your workbook</h2><p>Masking sensitive information. This may take a few minutes.</p><p>Please keep this window open.</p></div></div>
+<div class="loading" id="loading" role="status" aria-live="polite"><div class="loading-card"><div class="spinner" aria-hidden="true"></div><h2>Processing your workbook</h2><div class="bar" aria-hidden="true"><i id="pbar"></i></div><p class="pct" id="ppct">Starting…</p><p id="peta">Estimating time left…</p><p>Please keep this window open.</p></div></div>
 <script>
 const T="__TOKEN__",$=id=>document.getElementById(id);
 const api=(p,o={})=>fetch(p,{...o,headers:{"X-Token":T,"Content-Type":"application/json"}}).then(r=>r.json());
@@ -687,7 +691,7 @@ $("run").onclick=async()=>{
   const bad=Object.keys(roles).filter(flagged);
   if(bad.length&&!confirm(`${bad.length} column${bad.length>1?"s":""} tagged No PHI look sensitive:\n\n`+bad.slice(0,10).map(c=>`• ${c}: ${foundText(c)}`).join("\n")+`\n\nStart processing anyway?\n(Cancel goes back so you can review them.)`)){$("flagged").checked=true;goStep(2);renderCols();return}
   WARN=[];showWarnings();
-  $("log").textContent="";since=0;$("state").textContent="";$("run").disabled=true;$("loading").classList.add("active");
+  $("pbar").style.width="0";$("ppct").textContent="Starting…";$("peta").textContent="Estimating time left…";$("log").textContent="";since=0;$("state").textContent="";$("run").disabled=true;$("loading").classList.add("active");
   try {
   if(Object.keys(roles).length){const m=await post("/api/profile",{path:p,sheet:$("sheet").value,roles});$("log").textContent=m.error?"":`Using the ${m.saved} column marks shown in Step 2 (saved and remembered).\n`;if(!m.error){known();renderCols()}}
   const r=await post("/api/run",{path:p,presidio:$("presidio").checked});
@@ -696,8 +700,12 @@ $("run").onclick=async()=>{
   } catch(e){finishError(e)}
 };
 function finishError(e){clearInterval(timer);$('loading').classList.remove('active');$('run').disabled=false;$('state').className='state fail';$('state').textContent='Could not contact the local server. Check the connection and try again.';$('log').textContent=String(e);goStep(4)}
+function fmtLeft(s){s=Math.max(1,Math.round(s));return s<60?s+" sec":Math.floor(s/60)+" min "+String(s%60).padStart(2,"0")+" sec"}
+function showProgress(r){const g=r.progress||{total:0,done:0},f=g.total?Math.min(1,g.done/g.total):0;
+  $("pbar").style.width=(f*100)+"%";$("ppct").textContent=g.total?Math.floor(f*100)+"%":"Starting…";
+  $("peta").textContent=(f>0.03&&r.elapsed>3)?"About "+fmtLeft(r.elapsed*(1-f)/f)+" left":"Estimating time left…"}
 async function poll(){
-  try {const r=await api("/api/job?since="+since);since=r.n;
+  try {const r=await api("/api/job?since="+since);since=r.n;showProgress(r);
   if(r.lines.length){const l=$("log");l.textContent+=r.lines.join("\n")+"\n";l.scrollTop=l.scrollHeight;
     r.lines.forEach(t=>{const m=t.match(/WARNING: (.+?) \| (.+?) \| (.+) \| (\w+)\s*$/);if(m)WARN.push({sheet:m[1],col:m[2],found:m[3],suggest:m[4]})})}
   if(r.done){clearInterval(timer);loadOutputs();$("run").disabled=false;$("loading").classList.remove("active");
