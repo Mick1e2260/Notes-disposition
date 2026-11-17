@@ -48,7 +48,7 @@ Daily dump (OneDrive, contains PHI)
 python ar_auto_audit.py "<workbook.xlsx>" ["<output.xlsx>"]    # the audit (this section's rules engine)
 run_daily.bat                                                   # the UI: add a workbook, tag headers, mask, review, download, restore
 ```
-Requires Python 3.12 and `requirements.txt`. `build_exe.bat` builds the same UI as `dist\AR-Audit\AR-Audit.exe`.
+Requires Python 3.12 and `requirements.txt`.
 
 ---
 
@@ -239,5 +239,5 @@ Advisory only: QA confirms before agent feedback.
 | `reidentify.py` | Restores originals from a masked workbook |
 | `llm_audit.py`, `llm_classify.py`, `llm_context.md` | Local-Qwen review and classification, and the model's brief |
 | `doctor.py` | Diagnostic |
-| `run_daily.bat`, `build_exe.bat` | Start the UI; build the exe |
+| `run_daily.bat` | Start the UI |
 | `requirements.txt`, `.gitignore`, `CONTEXT.md` | Dependencies, data blocked from git, this document |
