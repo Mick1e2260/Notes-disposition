@@ -30,15 +30,6 @@ def main():
         check(f"library {mod}", lambda m=mod: (bool(importlib.import_module(m)), ""))
     check("spaCy model en_core_web_sm", lambda: (bool(__import__("spacy").load("en_core_web_sm")), ""))
 
-    def ollama():
-        models = webui.ollama_models()
-        return (bool(models), f"models: {', '.join(models)}" if models else
-                "Ollama is not answering on 127.0.0.1:11434. Start it (Start menu > Ollama) or run: ollama serve")
-    check("Ollama server", ollama)
-    def model():
-        ok = "qwen2.5:7b-instruct" in webui.ollama_models()
-        return ok, "" if ok else "missing: run  ollama pull qwen2.5:7b-instruct"
-    check("model qwen2.5:7b-instruct", model)
 
     def source():
         f = sorted(dm.SOURCE_DIR.glob(dm.PATTERN), key=lambda p: p.stat().st_mtime, reverse=True) if dm.SOURCE_DIR.exists() else []

@@ -36,11 +36,9 @@ Daily dump (OneDrive, contains PHI)
    │
    ├─► ar_auto_audit.py ── rules engine, runs fully local ──► AR Audit Result.xlsx (contains PHI; stays local)
    │
-   └─► AR Audit UI (run_daily.bat / AR-Audit.exe) ── mask ──► MASKED.xlsx   (the only file allowed to reach any AI model)
+   └─► AR Audit UI (run_daily.bat) ── mask ──► MASKED.xlsx   (safe to share)
                                                          ├─► QUARANTINE.xlsx (rows still risky; never sent, never offered for download)
                                                          └─► REID KEY.xlsx   (private folder; restores the originals)
-                                                                │
-                                                  local Ollama (Qwen): review / classify the MASKED file
 ```
 
 ### Run
@@ -149,12 +147,12 @@ re-identification key never go to a cloud service or to git (`.gitignore` blocks
 runs on this PC. Pattern and NER masking is not proof of de-identification: **compliance must approve** the method and a reviewed
 sample before masked files go anywhere outside this PC.
 
-### Workflow (`run_daily.bat`, or `AR-Audit.exe`)
+### Workflow (`run_daily.bat`)
 1. **Workbook:** drop or pick an .xlsx (held in memory only, never saved) or use the newest `AR Audit Result*.xlsx` from OneDrive.
    Every sheet is listed; title rows above the headers are skipped automatically.
 2. **Column privacy:** headers appear at once with suggested tags. Confirm or change them; they are remembered per file type.
-3. **Run options:** masked Excel only, or masked Excel + local-model review / classification.
-4. **Results:** download the masked workbook (and review output). Warnings, if any, are shown here.
+3. **Run options:** creates the masked workbook (Presidio + NER is optional).
+4. **Results:** download the masked workbook. Warnings, if any, are shown here.
 5. **Restore:** turn a masked workbook back into the originals (separate tool).
 
 `run_daily.bat` serves the page on this PC's network address with a secret key in the link (private-network clients only; Restore only
@@ -199,13 +197,6 @@ so `J**n` stays masked rather than restoring the wrong person). Date columns com
 or the date field). Not recoverable: dropped columns, quarantined rows, ambiguous stars. The restored file contains PHI: it is built in
 memory and streamed to the browser, never saved.
 
-### LLM review and classification (`llm_audit.py`, `llm_classify.py`, `llm_context.md`)
-Local Ollama, model `qwen2.5:7b-instruct` (CPU only: roughly 11-20 s per claim). Only the `- MASKED` file is read; every note is
-re-scanned for PHI first and a non-loopback Ollama host is refused. `llm_audit` reviews the claims the rules engine flagged on
-N01/N03/N04/N05/G01 plus a 10% control sample and compares Qwen with the rules (Confirmed / Possible false positive / NEW finding /
-Unclear). `llm_classify` predicts status, action and denial category for an Open AR sheet from labels found in the sheet itself and
-flags rows that differ from what the agent entered. `llm_context.md` is the plain-language brief given to the model; edit it to tune.
-Advisory only: QA confirms before agent feedback.
 
 ---
 
@@ -228,7 +219,7 @@ Advisory only: QA confirms before agent feedback.
 | File | Purpose |
 |---|---|
 | `ar_auto_audit.py` | Audit rules engine and scorecard writer |
-| `ar_audit.py` | Single entry point (the exe runs this): `ui`, `daily`, `mask`, `review`, `classify`, `doctor` |
+| `ar_audit.py` | Single entry point `ui`, `daily`, `mask`, `doctor` |
 | `webui.py` | The browser UI (page + local API) |
 | `daily_mask.py` | Masks a workbook (every sheet), saved configs, PHI Warnings sheet |
 | `phi_scrub.py` | The masking rules for free text |
@@ -237,7 +228,6 @@ Advisory only: QA confirms before agent feedback.
 | `mask_columns_logic.py` | Tags and the first-guess tag from a header name |
 | `headermem.py` | Header memory |
 | `reidentify.py` | Restores originals from a masked workbook |
-| `llm_audit.py`, `llm_classify.py`, `llm_context.md` | Local-Qwen review and classification, and the model's brief |
 | `doctor.py` | Diagnostic |
 | `run_daily.bat` | Start the UI |
 | `requirements.txt`, `.gitignore`, `CONTEXT.md` | Dependencies, data blocked from git, this document |

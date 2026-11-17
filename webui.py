@@ -2,8 +2,7 @@
 Local web UI (default). Serves one page on 127.0.0.1 only and opens it in your browser. No external fonts, scripts or
 requests: the page and API live in this process. Every API call needs a per-run token and a loopback Host header.
 
-Flow: 1 pick workbook  ->  2 mark which column headers hold PHI (saved per report type)  ->  3 run mask (+ local review).
-Steps run as child processes of this program (see self_cmd), so masking must succeed before any LLM step starts.
+Flow: 1 pick workbook  ->  2 mark which column headers hold PHI (saved per report type)  ->  3 run mask.
 Only headers are ever read for the page; the log shows counts, never cell data.
 """
 import contextlib
@@ -40,20 +39,11 @@ JOB = {"lines": [], "done": True, "ok": True, "running": False}
 LOCK = threading.Lock()
 ROLES = ml.ROLES
 FROZEN = getattr(sys, "frozen", False)
-DEFAULT_MODEL = "qwen2.5:7b-instruct"
 
 
 def self_cmd(*args):
     """Command line that runs this same program (the exe, or python) with `args`: used for the masking and review steps."""
     return ([sys.executable] if FROZEN else [sys.executable, str(Path(__file__).with_name("ar_audit.py"))]) + list(args)
-
-
-def ollama_models():
-    try:
-        with urllib.request.urlopen("http://127.0.0.1:11434/api/tags", timeout=2) as r:
-            return [m["name"] for m in json.loads(r.read())["models"]]
-    except Exception:
-        return []
 
 
 def say(s):
@@ -161,14 +151,6 @@ def preview(path, sheet, col, role):
     return out
 
 
-def resolve_mode(path, mode):
-    if mode != "auto":
-        return mode
-    kind = sheet_kind(path)
-    say(f"Detected sheet type: {kind or 'unknown'}")
-    return {"audit": "review", "inventory": "classify"}.get(kind, "mask")
-
-
 class _Say:
     def write(self, s):
         for line in s.splitlines():
@@ -188,7 +170,7 @@ def mask_uploaded(opts):
                        opts.get("presidio", True), suggest_all=True)
         return True
     except BaseException as e:  # includes SystemExit raised for 'no matching sheet'
-        say(f"Masking failed: {e if isinstance(e, SystemExit) else type(e).__name__ + ': ' + str(e)}. Nothing was sent to the LLM.")
+        say(f"Masking failed: {e if isinstance(e, SystemExit) else type(e).__name__ + ': ' + str(e)}.")
         return False
 
 
@@ -205,36 +187,17 @@ def run_job(opts):
 def _run_job(opts):
     p = opts["path"]
     mem = str(p).startswith("mem:")
-    try:
-        mode = resolve_mode(p, opts.get("mode", "auto"))
-    except Exception as e:
-        say(f"Could not read the workbook: {e}")
-        JOB.update(done=True, ok=False, running=False)
-        return
-    steps = [None if mem else self_cmd("mask", str(p), "--suggest", *([] if opts.get("presidio", True) else ["--no-presidio"]))]
-    if mode != "mask":
-        extra = ["--model", opts.get("model") or DEFAULT_MODEL]
-        if int(opts.get("limit") or 0) > 0:
-            extra += ["--limit", str(int(opts["limit"]))]
-        if mode == "classify":
-            extra.append("--all")
-        steps.append(self_cmd(mode, *extra))
-    ok = True
-    for i, cmd in enumerate(steps, 1):
-        name = "mask" if cmd is None else next(c for c in cmd if c in ("mask", "review", "classify"))
-        say(f"--- step {i}/{len(steps)}: {name} ---")
-        if cmd is None:
-            if not mask_uploaded(opts):
-                ok = False
-                break
-            continue
+    say("--- mask ---")
+    if mem:
+        ok = mask_uploaded(opts)
+    else:
+        cmd = self_cmd("mask", str(p), "--suggest", *([] if opts.get("presidio", True) else ["--no-presidio"]))
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, creationflags=0x08000000)
         for line in proc.stdout:
             say(line)
-        if proc.wait() != 0:
-            say("Masking failed. Nothing was sent to the LLM." if i == 1 else "Step failed.")
-            ok = False
-            break
+        ok = proc.wait() == 0
+        if not ok:
+            say("Masking failed.")
     JOB.update(done=True, ok=ok, running=False)
 
 
@@ -312,10 +275,7 @@ class H(BaseHTTPRequestHandler):
         try:
             if u.path == "/api/state":
                 files = dm.newest_sources()
-                models = ollama_models()
-                return self._send(200, {"path": str(files[0]) if files else "", "models": models,
-                                        "model": DEFAULT_MODEL if (not models or DEFAULT_MODEL in models) else models[0],
-                                        "ollama": bool(models), "out": str(dm.MASKED_DIR), "roles": ROLES})
+                return self._send(200, {"path": str(files[0]) if files else "", "out": str(dm.MASKED_DIR), "roles": ROLES})
             if u.path == "/api/sheets":
                 return self._send(200, {"sheets": sheets_of(q["path"])})
             if u.path == "/api/columns":
@@ -568,8 +528,8 @@ section.panel h2{font-size:27px;margin-bottom:8px} section.panel .hint{font-size
 .hot{color:var(--warn);font-weight:600}button.small{min-height:30px;padding:0 12px;font-size:12.5px}
 </style></head><body><main>
 <header>
-  <div><h1>AnkaShield</h1><p class="sub">Mask PHI on this PC, then review notes with a local model. Nothing leaves this machine.</p></div>
-  <div class="chips"><span class="chip" id="oll"><i></i><span>Ollama</span></span><button class="quiet" id="quit" title="Stop the local server">Quit</button></div>
+  <div><h1>AnkaShield</h1><p class="sub">Mask PHI on this PC. Nothing leaves this machine.</p></div>
+  <div class="chips"><button class="quiet" id="quit" title="Stop the local server">Quit</button></div>
 </header>
 
 <nav class="workspace-nav" aria-label="Workflow steps">
@@ -600,16 +560,8 @@ section.panel h2{font-size:27px;margin-bottom:8px} section.panel .hint{font-size
 </div></section>
 
 <section class="panel" id="step3"><div class="step">Step 3 of 4 · Configure</div><div>
-  <h2>Run</h2><p class="hint">Masking always runs first. If it fails, the review is skipped.</p>
-  <div class="row">
-    <select id="mode" aria-label="What to run">
-      <option value="mask">Masked Excel only</option><option value="auto">Masked Excel + LLM review (by sheet type)</option>
-      <option value="review">Mask + audit review</option><option value="classify">Mask + classify (Open AR)</option></select>
-  </div>
-  <div class="feature-help" id="modeHelp"></div>
+  <h2>Run</h2><p class="hint">Creates the masked workbook.</p>
   <div class="options">
-    <label>Local model <select id="model" aria-label="Model"></select> <span class="muted">Used for review and classification.</span></label>
-    <label>Max claims <input type="number" id="limit" min="0" value="0" title="0 = all"> <span class="muted">Limit the review; 0 processes all claims.</span></label>
     <label class="chk"><input type="checkbox" id="presidio" checked> Presidio + NER <span class="muted">Adds entity detection to help identify sensitive text.</span></label>
   </div>
   <div class="actions"><button data-next="2">← Back</button><button class="primary" id="run">Start processing →</button></div>
@@ -646,9 +598,6 @@ function goStep(n){
 }
 document.querySelectorAll('[data-step]').forEach(b=>b.onclick=()=>goStep(+b.dataset.step));
 document.querySelectorAll('[data-next]').forEach(b=>b.onclick=()=>goStep(+b.dataset.next));
-const modeDescriptions={mask:['Masked Excel only','Creates a masked workbook without running a model.'],auto:['Automatic review','Masks first, then selects a local model review based on the sheet type.'],review:['Audit review','Masks first, then reviews audit notes with the local model.'],classify:['Open AR classification','Masks first, then classifies Open AR notes with the local model.']};
-function showMode(){const d=modeDescriptions[$('mode').value];$('modeHelp').innerHTML=`<strong>${d[0]}</strong><p>${d[1]}</p>`;}
-$('mode').onchange=showMode;showMode();
 const known=()=>Object.keys(SRC).forEach(k=>SRC[k]="remembered");
 const esc=x=>String(x).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const HITLBL={phone:"phone numbers",email:"emails",ssn:"SSN-like numbers",address:"addresses",id:"IDs / long numbers",name:"person names",url:"links",dob:"dates of birth"};
@@ -741,7 +690,7 @@ $("run").onclick=async()=>{
   $("log").textContent="";since=0;$("state").textContent="";$("run").disabled=true;$("loading").classList.add("active");
   try {
   if(Object.keys(roles).length){const m=await post("/api/profile",{path:p,sheet:$("sheet").value,roles});$("log").textContent=m.error?"":`Using the ${m.saved} column marks shown in Step 2 (saved and remembered).\n`;if(!m.error){known();renderCols()}}
-  const r=await post("/api/run",{path:p,mode:$("mode").value,model:$("model").value,limit:+$("limit").value,presidio:$("presidio").checked});
+  const r=await post("/api/run",{path:p,presidio:$("presidio").checked});
   if(r.error){$("log").textContent=r.error;$("run").disabled=false;$("loading").classList.remove("active");$("state").className="state fail";$("state").textContent=r.error;goStep(4);return}
   timer=setInterval(poll,700);
   } catch(e){finishError(e)}
@@ -767,7 +716,7 @@ async function fetchFile(url,opts){
 const download=n=>fetchFile("/api/download?"+new URLSearchParams({file:n})).catch(e=>alert(e.message));
 async function loadOutputs(){
   const f=(await api("/api/outputs")).files||[];
-  $("results").innerHTML=f.length?f.map(o=>`<div class="frow"><span class="fn"><b>${esc(o.name)}</b><small>${o.kind==="masked"?"Masked workbook":"Review output"} · ${esc(o.when)} · ${o.kb} KB</small></span><button data-n="${esc(o.name)}" class="dl ${o.kind==="masked"?"primary":""}">Download</button></div>`).join(""):'<p class="muted">Nothing yet. Run a mask to create a masked workbook.</p>';
+  $("results").innerHTML=f.length?f.map(o=>`<div class="frow"><span class="fn"><b>${esc(o.name)}</b><small>${o.kind==="masked"?"Masked workbook":"Result"} · ${esc(o.when)} · ${o.kb} KB</small></span><button data-n="${esc(o.name)}" class="dl ${o.kind==="masked"?"primary":""}">Download</button></div>`).join(""):'<p class="muted">Nothing yet. Run a mask to create a masked workbook.</p>';
   document.querySelectorAll(".dl").forEach(b=>b.onclick=()=>download(b.dataset.n));
   const keep=$("rsel").value;$("rsel").innerHTML=f.map(o=>`<option value="${esc(o.name)}">${esc(o.name)}</option>`).join("");if(keep)$("rsel").value=keep;
 }
@@ -801,8 +750,6 @@ $("restore").onclick=async()=>{
 };
 (async()=>{
   const s=await api("/api/state");ROLES=s.roles;
-  $("oll").className="chip "+(s.ollama?"on":"off");$("oll").lastChild.textContent=s.ollama?"Ollama ready":"Ollama offline";
-  $("model").innerHTML=(s.models.length?s.models:[s.model]).map(m=>`<option ${m===s.model?"selected":""}>${m}</option>`).join("");
   if(s.path)setPath(s.path);loadOutputs();
 })();
 </script></body></html>'''

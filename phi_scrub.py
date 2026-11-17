@@ -1,5 +1,5 @@
 """
-The masking rules for free text (HIPAA Safe Harbor style), used by daily_mask.py before anything reaches an LLM.
+The masking rules for free text (HIPAA Safe Harbor style), used by daily_mask.py.
 
 Masked: person names (rep, subscriber, patient), phone/fax, email, URL, SSN, street / PO Box addresses and ZIPs,
 every long ID (claim #, ICN, member ID, auth #, call ref, EFT/check #, case #, batch #, card #), any other run of
@@ -15,7 +15,7 @@ import re
 
 NOTES = "Notes (PHI Safe"
 # Private salt: same salt -> stable tokens across days. daily_mask.private_setup() generates it and keeps it outside the repo.
-ORIG_TAG = "(Originals)"  # a sheet named "... (Originals)" holds real identifier values: the LLM steps and Restore skip it
+ORIG_TAG = "(Originals)"  # a sheet named "... (Originals)" holds real identifier values: Restore skips it
 SALT = ""
 
 # Columns that carry identifiers and are not needed by an AI reviewer

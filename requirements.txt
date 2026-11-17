@@ -3,5 +3,4 @@ openpyxl
 presidio-analyzer
 spacy
 # python -m spacy download en_core_web_sm     (or en_core_web_lg for better NER)
-# Ollama + model:  ollama pull qwen2.5:7b-instruct
 

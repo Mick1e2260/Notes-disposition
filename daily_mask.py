@@ -1,5 +1,5 @@
 """
-PHI mask for the AR Excel sheets (Open AR inventory, WFM aging, AR audit result). Run BEFORE anything touches an LLM.
+PHI mask for the AR Excel sheets (Open AR inventory, WFM aging, AR audit result).
 
 Usage:  python daily_mask.py [workbook.xlsx ...] [--date YYYY-MM-DD] [--no-presidio]
         (no path -> newest 'AR Audit Result*.xlsx' in SOURCE_DIR)
@@ -318,7 +318,7 @@ def process(raw, filename, anchor, use_presidio=True, suggest_all=False):
             print(line)
             if len(quar):
                 print(quar["Residual Risk"].str.split(", ").explode().value_counts().to_string())
-        for sn, wo in with_orig.items():  # real identifiers beside the tokens, on their own sheet (skipped by the LLM steps and Restore)
+        for sn, wo in with_orig.items():  # real identifiers beside the tokens, on their own sheet (skipped by Restore)
             wo.to_excel(ws, sheet_name=f"{sn[:31 - len(ps.ORIG_TAG) - 1]} {ps.ORIG_TAG}", index=False)
         if warnings:  # the flag travels with the file: anyone opening the masked workbook sees which columns to double-check
             pd.DataFrame(warnings).to_excel(ws, sheet_name="PHI Warnings", index=False)
