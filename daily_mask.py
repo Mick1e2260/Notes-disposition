@@ -36,7 +36,7 @@ import phi_scrub as ps
 import phiscan
 
 SOURCE_DIR = Path(os.environ.get("AR_AUDIT_SOURCE_DIR", r"C:\Users\mick.harper\OneDrive - Anka"))
-MASKED_DIR = Path(os.environ.get("AR_AUDIT_MASKED_DIR", r"C:\AI_Agents\Notes-Disposition-Automation\masked_out"))
+MASKED_DIR = Path(os.environ.get("AR_AUDIT_MASKED_DIR", Path(__file__).resolve().parent.parent / "masked_out"))
 PRIVATE_DIR = Path(os.environ.get("AR_AUDIT_PRIVATE_DIR", Path(os.environ["LOCALAPPDATA"]) / "AnkaARAudit" / "private"))
 PATTERN = "AR Audit Result*.xlsx"
 
