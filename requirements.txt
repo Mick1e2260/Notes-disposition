@@ -1,0 +1,6 @@
+pandas
+openpyxl
+presidio-analyzer
+spacy
+# python -m spacy download en_core_web_sm     (or en_core_web_lg for better NER)
+

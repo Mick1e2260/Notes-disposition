@@ -30,8 +30,6 @@ CODING_ACTIONS = {"Routed Back to AR Team", "Coding Error Fixed & Resubmitted",
 ACTION_ALIAS = {"Escalate to Client": "Escalated to Onshore Team",
                 "Adjustment Processed - Post": "Adjustment Processed",
                 "Adjustment Processed - Park": "Adjustment Processed"}
-FOLLOWUP_STATUSES = {"Acknowledged/Received", "In Process", "Pending - Info Requested",
-                     "Scheduled to Pay", "Not on File", "Claim Edit/Scrubber Edits", "Paid"}
 CALL_SOURCES = {"Payer Call", "IVR", "Payer Call Back"}
 
 
@@ -93,10 +91,6 @@ NOTE_STATUS = [
     ("Paid", rx(r"\bpaid \$?\d", r"\bpd\$?\d", r"paid (with|via|on|under)", r"eft ?#", r"check ?#")),
     ("In Process", rx(r"in process", r"under review", r"pending review")),
 ]
-# what a disposition's own family looks like
-ACTION_FAMILY = {
-    "Follow-Up Required": {"Follow-Up Required"},
-}
 SAME_FAMILY = [  # action pairs that must not be flagged against each other
     {"Claim Resubmitted", "Corrected Claim Resubmitted", "Rebilled to Correct Payer", "Coding Error Fixed & Resubmitted"},
     {"Appeal Submitted", "Second Level Appeal Submitted", "Medical Records Submitted", "Appeal Required"},
@@ -143,7 +137,6 @@ def audit(df, grid, rca_map):
     for (st, cat), s in rca_map.items():
         rca_by_cat.setdefault(cat if st in ("Denied", "Rejected") else st, set()).update(s)
     denial_cats = {c for (s, c) in rca_map if s == "Denied"}
-    rej_cats = {c for (s, c) in rca_map if s == "Rejected"}
 
     findings = []
 
